@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DocMind DZ · 主单 / 分单 / 舱单核对台</title>
+    <link rel="stylesheet" href="styles.css?v=20261020" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">DZ</span>
+          <div>
+            <div class="brand-name">DocMind DZ</div>
+            <div class="brand-subtitle">主单 · 分单 · 舱单核对台</div>
+          </div>
+        </div>
+        <div class="topbar-meta">
+          <span class="live-dot"></span>
+          <span>本地工作区</span>
+          <button class="icon-button" id="refreshButton" title="刷新任务列表">↻</button>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <aside class="panel file-panel">
+          <div class="panel-heading">
+            <div>
+              <div class="eyebrow">SOURCE FILES</div>
+              <h1>任务</h1>
+            </div>
+            <span class="count-badge" id="taskCount">0</span>
+          </div>
+
+          <label class="upload-dropzone" id="uploadDropzone">
+            <span class="dropzone-icon">＋</span>
+            <strong>添加单证文件</strong>
+            <small>PDF / Word / Excel / 图片<br />可一次选择分单 + 舱单</small>
+            <input
+              type="file"
+              id="fileInput"
+              hidden
+              multiple
+              accept=".pdf,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp"
+            />
+          </label>
+
+          <div class="file-list" id="taskList">
+            <div class="empty-state">还没有任务</div>
+          </div>
+
+          <div class="file-panel-foot">
+            <span class="dot"></span>
+            主单识别后跳过抽取，只核对分单与舱单
+          </div>
+        </aside>
+
+        <section class="panel process-panel">
+          <div class="panel-heading">
+            <div>
+              <div class="eyebrow">WORKFLOW TRACE</div>
+              <h1>运行过程</h1>
+            </div>
+            <div class="process-actions">
+              <span class="status-pill idle" id="selectedStatus">未选择任务</span>
+              <button class="secondary-button" id="pauseButton" disabled>暂停</button>
+              <button class="secondary-button" id="cancelButton" disabled>取消</button>
+            </div>
+          </div>
+
+          <div class="selected-file">
+            <span class="file-symbol" id="selectedType">—</span>
+            <div class="selected-copy">
+              <strong id="selectedName">请选择左侧任务</strong>
+              <span id="selectedTaskId">任务 ID 未加载</span>
+            </div>
+          </div>
+
+          <div class="progress-track">
+            <div class="progress-value" id="progressBar"></div>
+          </div>
+          <div class="progress-summary">
+            <span id="progressLabel">等待运行</span>
+            <strong id="progressPercent">0%</strong>
+          </div>
+
+          <div class="event-list" id="eventList"></div>
+        </section>
+
+        <section class="panel result-panel">
+          <div class="panel-heading">
+            <div>
+              <div class="eyebrow">OUTPUT JSON</div>
+              <h1>字段提取</h1>
+            </div>
+            <div class="result-actions">
+              <button class="secondary-button prepare-button" id="prepareButton" disabled>
+                开始提交
+              </button>
+              <button class="secondary-button" id="copyButton" disabled>复制 JSON</button>
+            </div>
+          </div>
+
+          <div class="result-summary" id="resultSummary">
+            <span class="muted">尚未加载结果</span>
+          </div>
+          <div class="review-area" id="reviewArea"></div>
+          <pre class="result-json" id="resultJson"><code>{}</code></pre>
+        </section>
+      </section>
+    </main>
+
+    <div id="dialogRoot"></div>
+    <div class="toast" id="toast"></div>
+
+    <script type="module" src="app.js?v=20261020"></script>
+  </body>
+</html>

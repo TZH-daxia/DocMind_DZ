@@ -1,0 +1,32 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# ---- 环境与依赖 ----
+.venv/
+.env
+
+# ---- 测试 / 静态检查缓存 ----
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---- 运行时产物（含客户单证，切勿提交）----
+data/
+logs/
+*.log
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- AI 工具本地数据 ----
+.codebuddy/
+.playwright-cli/

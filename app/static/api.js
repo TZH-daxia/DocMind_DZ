@@ -1,0 +1,92 @@
+// 后端接口封装。BASE 与后端 api_prefix 保持一致（默认 /dz）。
+const BASE = "/dz/analysis";
+
+async function request(path, options = {}) {
+  const response = await fetch(`${BASE}${path}`, options);
+  if (!response.ok) {
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+    const detail = payload && payload.detail;
+    const message =
+      (detail && detail.message) ||
+      (typeof detail === "string" ? detail : null) ||
+      `请求失败（HTTP ${response.status}）`;
+    const error = new Error(message);
+    error.code = detail && detail.code;
+    error.status = response.status;
+    throw error;
+  }
+  return response.json();
+}
+
+export const api = {
+  listTasks: () => request("/tasks"),
+
+  getTask: (taskId) => request(`/tasks/${encodeURIComponent(taskId)}`),
+
+  getResult: (taskId) => request(`/tasks/${encodeURIComponent(taskId)}/result`),
+
+  getFields: () => request("/fields"),
+
+  getEvents: (taskId) =>
+    request(`/tasks/${encodeURIComponent(taskId)}/events/history`),
+
+  createTask(files) {
+    const form = new FormData();
+    const list = Array.isArray(files) ? files : [files];
+    for (const file of list) form.append("files", file);
+    return request("/tasks", { method: "POST", body: form });
+  },
+
+  pauseTask: (taskId) =>
+    request(`/tasks/${encodeURIComponent(taskId)}/pause`, { method: "POST" }),
+
+  resumeTask: (taskId) =>
+    request(`/tasks/${encodeURIComponent(taskId)}/resume`, { method: "POST" }),
+
+  cancelTask: (taskId) =>
+    request(`/tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST" }),
+
+  submitTask: (taskId, payload) =>
+    request(`/tasks/${encodeURIComponent(taskId)}/submit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+
+  getSubmission: (taskId) =>
+    request(`/tasks/${encodeURIComponent(taskId)}/submission`),
+
+  subscribe(taskId, { onEvent, onDone, onError }) {
+    const source = new EventSource(
+      `${BASE}/tasks/${encodeURIComponent(taskId)}/events`
+    );
+    source.onmessage = (event) => {
+      try {
+        onEvent(JSON.parse(event.data));
+      } catch {
+        /* 忽略无法解析的事件 */
+      }
+    };
+    source.addEventListener("done", (event) => {
+      source.close();
+      try {
+        onDone(JSON.parse(event.data));
+      } catch {
+        onDone(null);
+      }
+    });
+    source.onerror = () => {
+      source.close();
+      onError && onError();
+    };
+    return () => source.close();
+  },
+
+  pageImageUrl: (taskId, index) =>
+    `${BASE}/tasks/${encodeURIComponent(taskId)}/pages/${index}`,
+};
