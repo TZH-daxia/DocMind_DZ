@@ -23,8 +23,9 @@ from app.schemas.documents import (
     FieldComparison,
     HouseBillComparison,
     ManifestDocument,
+    TotalsCheck,
 )
-from app.schemas.fields import COMPARE_FIELD_SPECS, FieldSpec
+from app.schemas.fields import COMPARE_FIELD_SPECS, HOUSE_KEY_BY_COMPARE_KEY, FieldSpec
 from app.service.normalizers import (
     normalize_date,
     normalize_doc_no,
@@ -194,13 +195,10 @@ def compare_field(
 
 
 def _bill_status(fields: list[FieldComparison]) -> BillStatus:
+    """整单状态只看真实差异：缺值不算「信息不全」，只在舱单字段上标「未校验」。"""
+
     if any(field.status == "mismatch" for field in fields):
         return "inconsistent"
-    if any(
-        field.status.startswith("missing") and field.status != "missing_both"
-        for field in fields
-    ):
-        return "incomplete"
     return "consistent"
 
 
@@ -243,7 +241,8 @@ def compare(
 
     for bill in house_bills:
         fields = bill.get("fields") or {}
-        hawb_key = normalize_doc_no(fields.get("hawb_no"))
+        house_hawb = fields.get(HOUSE_KEY_BY_COMPARE_KEY["hawb_no"])
+        hawb_key = normalize_doc_no(house_hawb)
         entry_position = None
         if hawb_key:
             for candidate in entry_index.get(hawb_key, []):
@@ -256,21 +255,24 @@ def compare(
             comparisons.append(
                 HouseBillComparison(
                     bill_id=str(bill.get("bill_id", "")),
-                    hawb_no=fields.get("hawb_no"),
+                    hawb_no=house_hawb,
                     status="incomplete",
                     missing_count=len(COMPARE_FIELD_SPECS),
                     fields=_missing_comparisons(),
                 )
             )
             if hawb_key:
-                warnings.append(
-                    f"分单 {fields.get('hawb_no')} 在舱单中未找到对应行"
-                )
+                warnings.append(f"分单 {house_hawb} 在舱单中未找到对应行")
             continue
 
         entry = entries[entry_position]
         field_results = [
-            compare_field(spec, fields.get(spec.key), entry.fields.get(spec.key))
+            compare_field(
+                spec,
+                # 分单字段已按单证接口命名，个别字段与舱单口径不同名
+                fields.get(HOUSE_KEY_BY_COMPARE_KEY.get(spec.key, spec.key)),
+                entry.fields.get(spec.key),
+            )
             for spec in COMPARE_FIELD_SPECS
         ]
         mismatch_count = sum(1 for field in field_results if field.status == "mismatch")
@@ -282,7 +284,7 @@ def compare(
         comparisons.append(
             HouseBillComparison(
                 bill_id=str(bill.get("bill_id", "")),
-                hawb_no=fields.get("hawb_no") or entry.fields.get("hawb_no"),
+                hawb_no=house_hawb or entry.fields.get("hawb_no"),
                 manifest_entry_id=entry.entry_id,
                 manifest_line_no=entry.line_no,
                 status=_bill_status(field_results),
@@ -317,8 +319,9 @@ def compare(
             "舱单中存在未匹配到分单的行：" + "、".join(str(item) for item in unmatched if item)
         )
 
+    house_hawb_key = HOUSE_KEY_BY_COMPARE_KEY["hawb_no"]
     duplicate_bills = _duplicates(
-        normalize_doc_no(bill.get("fields", {}).get("hawb_no")) for bill in house_bills
+        normalize_doc_no(bill.get("fields", {}).get(house_hawb_key)) for bill in house_bills
     )
     if duplicate_bills:
         warnings.append("分单号重复：" + "、".join(duplicate_bills))
@@ -329,6 +332,192 @@ def compare(
         warnings.append("舱单分单号重复：" + "、".join(duplicate_entries))
 
     return comparisons, summary, warnings
+
+
+TOTALS_LABELS: dict[str, str] = {
+    "dest_port": "目的港",
+    "pieces": "件数",
+    "weight": "重量",
+    "chargeable_weight": "计费重量",
+    "volume": "体积",
+}
+
+
+def _sum_field(
+    house_bills: list[dict], key: str, kind: str
+) -> tuple[float, int]:
+    """把多份分单的某个数值字段求和，返回 (合计, 有效份数)。"""
+
+    total = 0.0
+    found = 0
+    house_key = HOUSE_KEY_BY_COMPARE_KEY.get(key, key)
+    for bill in house_bills:
+        value = (bill.get("fields") or {}).get(house_key)
+        number = normalize_int(value) if kind == "integer" else normalize_number(value)
+        if number is None:
+            continue
+        total += number
+        found += 1
+    return round(total, 4), found
+
+
+def _format_total(value: float | None, kind: str) -> str | None:
+    if value is None:
+        return None
+    if kind == "integer":
+        return str(int(round(value)))
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _totals_check(
+    key: str,
+    house_bills: list[dict],
+    manifest_value: str | None,
+    *,
+    kind: str = "number",
+    mode: str = "equal",
+) -> TotalsCheck:
+    label = TOTALS_LABELS[key]
+    total, found = _sum_field(house_bills, key, kind)
+    master_number = (
+        normalize_int(manifest_value)
+        if kind == "integer"
+        else normalize_number(manifest_value)
+    )
+    house_text = _format_total(total, kind) if found else None
+    master_text = _format_total(master_number, kind) if master_number is not None else None
+
+    if master_number is None:
+        return TotalsCheck(
+            key=key,
+            label=label,
+            status="missing",
+            house_total=house_text,
+            manifest_total=None,
+            note=f"舱单未提供总运单{label}",
+        )
+    if not found:
+        return TotalsCheck(
+            key=key,
+            label=label,
+            status="missing",
+            house_total=None,
+            manifest_total=master_text,
+            note=f"分单未提供{label}",
+        )
+
+    if mode == "at_least":
+        ok = total + NUMBER_ABSOLUTE_TOLERANCE >= master_number
+        note = (
+            "分单合计不小于总运单"
+            if ok
+            else f"分单合计 {house_text} 小于总运单 {master_text}"
+        )
+    else:
+        ok = _numeric_match(total, master_number, tolerance=NUMBER_RELATIVE_TOLERANCE)
+        note = (
+            "分单合计与总运单一致"
+            if ok
+            else f"分单合计 {house_text} ≠ 总运单 {master_text}"
+        )
+    return TotalsCheck(
+        key=key,
+        label=label,
+        status="match" if ok else "mismatch",
+        house_total=house_text,
+        manifest_total=master_text,
+        note=note,
+    )
+
+
+def compare_totals(
+    house_bills: list[dict],
+    manifest: ManifestDocument | None,
+) -> list[TotalsCheck]:
+    """分单合计与舱单总运单汇总的核对（5 条汇总规则）。"""
+
+    if manifest is None:
+        return []
+    master = manifest.master
+    checks: list[TotalsCheck] = []
+
+    # 1. 目的港：任意一份分单的目的港与总运单不一致即判失败
+    house_port_key = HOUSE_KEY_BY_COMPARE_KEY["dest_port"]
+    house_ports = [
+        normalize_port((bill.get("fields") or {}).get(house_port_key))
+        for bill in house_bills
+    ]
+    house_ports = [port for port in house_ports if port]
+    master_port = normalize_port(master.dest_port) if master else ""
+    if not master_port:
+        checks.append(
+            TotalsCheck(
+                key="dest_port",
+                label="目的港",
+                status="missing",
+                house_total="、".join(sorted(set(house_ports))) or None,
+                manifest_total=None,
+                note="舱单未提供总运单目的港",
+            )
+        )
+    elif not house_ports:
+        checks.append(
+            TotalsCheck(
+                key="dest_port",
+                label="目的港",
+                status="missing",
+                house_total=None,
+                manifest_total=master_port,
+                note="分单未提供目的港",
+            )
+        )
+    else:
+        mismatched = sorted({port for port in house_ports if port != master_port})
+        if mismatched:
+            checks.append(
+                TotalsCheck(
+                    key="dest_port",
+                    label="目的港",
+                    status="mismatch",
+                    house_total="、".join(sorted(set(house_ports))),
+                    manifest_total=master_port,
+                    note=f"分单目的港（{'、'.join(mismatched)}）与舱单总运单不一致",
+                )
+            )
+        else:
+            checks.append(
+                TotalsCheck(
+                    key="dest_port",
+                    label="目的港",
+                    status="match",
+                    house_total=master_port,
+                    manifest_total=master_port,
+                    note="全部分单目的港与总运单一致",
+                )
+            )
+
+    # 2-5. 件数 / 重量 / 计费重量 / 体积
+    checks.append(
+        _totals_check(
+            "pieces", house_bills, master.pieces if master else None, kind="integer"
+        )
+    )
+    checks.append(
+        _totals_check("weight", house_bills, master.weight if master else None)
+    )
+    checks.append(
+        _totals_check(
+            "chargeable_weight",
+            house_bills,
+            master.chargeable_weight if master else None,
+            mode="at_least",
+        )
+    )
+    checks.append(
+        _totals_check("volume", house_bills, master.volume if master else None)
+    )
+    return checks
 
 
 def _duplicates(values) -> list[str]:

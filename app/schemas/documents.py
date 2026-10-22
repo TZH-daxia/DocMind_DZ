@@ -5,8 +5,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from app.schemas.fields import FIELD_KEYS
-
 DocKind = Literal["master_bill", "house_bill", "manifest", "other"]
 TextSource = Literal["text_layer", "docx", "xlsx", "vlm", "empty"]
 CompareStatus = Literal[
@@ -74,17 +72,17 @@ class MasterBillInfo(BaseModel):
     skipped: bool = True
 
 
-class DocumentFields(BaseModel):
-    """分单/舱单共有的 16 字段扁平结构（核对口径）。"""
-
-    values: dict[str, str | None] = Field(default_factory=lambda: dict.fromkeys(FIELD_KEYS))
-
-
 class HouseBill(BaseModel):
     bill_id: str
     segment_id: str
     page_indexes: list[int] = Field(default_factory=list)
     fields: dict[str, str | None] = Field(default_factory=dict)
+    # 字段在原图中的位置：key → [{page, bbox:[x,y,w,h]}]，供前端点击字段时高亮
+    field_locations: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    # 无法确定标准值时保留的原文（如港口只写了城市名），供待审核引用
+    field_evidence: dict[str, str] = Field(default_factory=dict)
+    # 定位用的页面原文（如港口归一成三字码后，原文仍用于在原图上找位置）
+    field_sources: dict[str, str] = Field(default_factory=dict)
     confidence: float = 0.6
     warnings: list[str] = Field(default_factory=list)
     source_excerpt: str = ""
@@ -95,14 +93,28 @@ class ManifestEntry(BaseModel):
     line_no: int | None = None
     page_indexes: list[int] = Field(default_factory=list)
     fields: dict[str, str | None] = Field(default_factory=dict)
+    # 字段在原图中的位置：key → [{page, bbox}]，点击舱单字段时高亮
+    field_locations: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     confidence: float = 0.6
     warnings: list[str] = Field(default_factory=list)
+
+
+class ManifestMaster(BaseModel):
+    """舱单里的总运单（主单）汇总行：用于和分单合计值核对。"""
+
+    mawb_no: str | None = None
+    dest_port: str | None = None
+    pieces: str | None = None
+    weight: str | None = None
+    chargeable_weight: str | None = None
+    volume: str | None = None
 
 
 class ManifestDocument(BaseModel):
     segment_id: str
     page_indexes: list[int] = Field(default_factory=list)
     entries: list[ManifestEntry] = Field(default_factory=list)
+    master: ManifestMaster | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -127,10 +139,6 @@ class HouseBillComparison(BaseModel):
     missing_count: int = 0
     fields: list[FieldComparison] = Field(default_factory=list)
 
-    @property
-    def key_mismatch(self) -> bool:
-        return self.manifest_entry_id is None
-
 
 class ComparisonSummary(BaseModel):
     total_house_bills: int = 0
@@ -143,6 +151,17 @@ class ComparisonSummary(BaseModel):
     field_mismatch_count: int = 0
 
 
+class TotalsCheck(BaseModel):
+    """汇总核对：分单合计值 vs 舱单总运单汇总值。"""
+
+    key: str
+    label: str
+    status: Literal["match", "mismatch", "missing"] = "missing"
+    house_total: str | None = None
+    manifest_total: str | None = None
+    note: str = ""
+
+
 class ReviewItem(BaseModel):
     """待人工审核的一条记录（差异 / 缺失 / 近似 / 低置信度）。"""
 
@@ -153,6 +172,8 @@ class ReviewItem(BaseModel):
     label: str
     reason: Literal["mismatch", "missing", "similar", "low_confidence"]
     message: str
+    # 原文引用：前端在字段下展示「原文：…」，用于人工确认识别是否准确
+    evidence: str = ""
 
 
 class AnalysisResult(BaseModel):
@@ -170,6 +191,7 @@ class AnalysisResult(BaseModel):
     house_bills: list[HouseBill] = Field(default_factory=list)
     manifest: ManifestDocument | None = None
     comparisons: list[HouseBillComparison] = Field(default_factory=list)
+    totals_checks: list[TotalsCheck] = Field(default_factory=list)
     summary: ComparisonSummary = Field(default_factory=ComparisonSummary)
     review_items: list[ReviewItem] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
@@ -192,6 +214,8 @@ class TaskSnapshot(BaseModel):
     house_bill_count: int = 0
     manifest_entry_count: int = 0
     inconsistent_count: int = 0
+    # 结果文件是否已落盘：弹窗页签只显示有结果的任务
+    result_available: bool = False
     submitted: bool = False
     submitted_at: datetime | None = None
     submission_code: str | None = None

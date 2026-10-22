@@ -85,6 +85,41 @@ async def test_pipeline_succeeds_with_master_only_file(settings, tmp_path):
     assert any("主单" in warning for warning in result["warnings"])
 
 
+async def test_manifest_only_file_succeeds_with_hint(settings, tmp_path):
+    """只有舱单时同样跳过抽取，并提示补充分单与主单。"""
+
+    pdf = write_pdf(tmp_path / "manifest_only.pdf", [MANIFEST_PAGE])
+    service = TaskService(settings)
+    snapshot = service.create_task(
+        UploadedDocument(filename="manifest_only.pdf", content=pdf.read_bytes())
+    )
+    await _run_task(service, snapshot.task_id)
+
+    assert service.get_snapshot(snapshot.task_id).status == "succeeded"
+    result = service.get_result(snapshot.task_id)
+    assert result["house_bills"] == []
+    assert any("只包含舱单" in warning for warning in result["warnings"])
+
+
+async def test_master_only_file_skips_extract_and_verify_nodes(settings, tmp_path):
+    """只有主单时，图应直接跳到结果装配，不执行抽取与核对节点。"""
+
+    pdf = write_pdf(tmp_path / "master_single.pdf", [MASTER_PAGE])
+    service = TaskService(settings)
+    snapshot = service.create_task(
+        UploadedDocument(filename="master_single.pdf", content=pdf.read_bytes())
+    )
+    await _run_task(service, snapshot.task_id)
+
+    assert service.get_snapshot(snapshot.task_id).status == "succeeded"
+    events = service.read_events(snapshot.task_id)
+    skipped = {event.step for event in events if event.phase == "skipped"}
+    started = {event.step for event in events if event.phase == "started"}
+    assert skipped == {"抽取分单与舱单字段", "核对分单与舱单"}
+    assert "抽取分单与舱单字段" not in started
+    assert "核对分单与舱单" not in started
+
+
 async def test_pipeline_accepts_house_pdf_with_manifest_xlsx(settings, tmp_path):
     from openpyxl import Workbook
 

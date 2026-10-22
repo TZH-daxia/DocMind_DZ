@@ -13,9 +13,11 @@ from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.agent.circuit import CircuitBreaker
 from app.agent.model_call import ProviderCall, call_with_failover
 from app.agent.providers import ModelProvider, build_providers
 from app.config import Settings
+from app.service.gates import ConcurrencyGates
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +27,17 @@ class ModelGateway:
         self,
         settings: Settings,
         providers: list[ModelProvider] | None = None,
+        gates: ConcurrencyGates | None = None,
     ) -> None:
         self.settings = settings
         self.providers = providers or build_providers(settings)
         self._semaphore = asyncio.Semaphore(settings.model_max_concurrency)
+        # 与任务/Office 共用一套闸门时，排队人数才能被统一观测；否则退回私有信号量
+        self.gates = gates
+        self._circuit = CircuitBreaker(
+            fail_threshold=settings.model_circuit_failures,
+            cooldown_seconds=settings.model_circuit_cooldown_seconds,
+        )
         self._clients: dict[tuple[str, bool], object] = {}
 
     def _client(self, provider: ModelProvider, *, vision: bool):
@@ -76,10 +85,9 @@ class ModelGateway:
 
         def make_call(provider: ModelProvider) -> ProviderCall:
             async def factory() -> str:
-                async with self._semaphore:
-                    model = self._client(provider, vision=vision)
-                    response = await model.ainvoke(messages)
-                    return _content_to_text(response.content)
+                model = self._client(provider, vision=vision)
+                response = await model.ainvoke(messages)
+                return _content_to_text(response.content)
 
             return ProviderCall(
                 provider=provider.name,
@@ -87,12 +95,22 @@ class ModelGateway:
                 factory=factory,
                 timeout_seconds=timeout_seconds,
                 retries=self.settings.model_call_retries,
+                # 闸门交给 model_call：排队时间不计入超时，退避等待时释放槽位
+                guard=lambda: self._model_gate(),
             )
 
         calls = [make_call(provider) for provider in self.providers]
         return await call_with_failover(
-            label, calls, should_retry=lambda text: not str(text or "").strip()
+            label,
+            calls,
+            should_retry=lambda text: not str(text or "").strip(),
+            circuit=self._circuit,
         )
+
+    def _model_gate(self):
+        if self.gates is not None:
+            return self.gates.acquire("model", self.settings.model_max_concurrency)
+        return self._semaphore
 
 
 def _content_to_text(content: object) -> str:
@@ -116,7 +134,7 @@ def _image_data_url(path: Path) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
-def build_gateway(settings: Settings):
+def build_gateway(settings: Settings, gates: ConcurrencyGates | None = None):
     """按配置构造网关；mock 模式返回固定样例网关。"""
 
     if settings.mock_llm:
@@ -124,4 +142,4 @@ def build_gateway(settings: Settings):
 
         logger.warning("已启用 MOCK_LLM：不会调用真实模型，仅用于本地演示")
         return MockModelGateway(settings)
-    return ModelGateway(settings)
+    return ModelGateway(settings, gates=gates)

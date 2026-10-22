@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from app.agent.model_call import ModelCallFailedError
+from app.collector.locator import locate_fields, locate_manifest_fields
 from app.collector.parsers import ParserError, build_default_registry
 from app.collector.segmenter import (
     PageKind,
@@ -34,11 +35,14 @@ from app.schemas.documents import (
     HouseBillComparison,
     ManifestDocument,
     ManifestEntry,
+    ManifestMaster,
     MasterBillInfo,
     PageRecord,
     Segment,
+    TotalsCheck,
 )
-from app.service.consistency import compare
+from app.schemas.fields import FIELD_LABELS
+from app.service.consistency import compare, compare_totals
 from app.service.extraction import (
     ExtractionError,
     classify_pages_with_llm,
@@ -46,11 +50,89 @@ from app.service.extraction import (
     extract_manifest,
     transcribe_page,
 )
+from app.service.gates import ConcurrencyGates
+from app.service.ports import normalize_port_fields
 from app.service.review import build_review_items
 from app.storage.file_store import FileStore
 from app.workflow.state import AnalysisState
 
 logger = logging.getLogger(__name__)
+
+# Office 文档要经 LibreOffice 转 PDF：单实例进程，必须串行（并发闸门 "office"）
+OFFICE_SUFFIXES = (".doc", ".docx", ".xls", ".xlsx")
+
+# 货物行右侧的计价列：Rate/Charge 与 Total 必须与计费重量同行、且在其右侧
+CHARGE_COLUMN_KEYS: tuple[str, ...] = ("rate", "ratetotal")
+# 同行判定：归一化坐标下的纵向容差（约 6pt / 842pt）
+CHARGE_ROW_SLACK = 0.007
+
+# 单证文本层应当出现的关键标签：只有数字、没有这些标签的文本层视为不可用
+DOC_TEXT_LABELS: tuple[str, ...] = (
+    "AIR WAYBILL",
+    "WAYBILL",
+    "HAWB",
+    "MAWB",
+    "SHIPPER",
+    "CONSIGNEE",
+    "MASTER",
+    "HOUSE",
+    "运单",
+    "分单",
+    "主单",
+    "舱单",
+    "MANIFEST",
+)
+
+
+def _drop_unreliable_charge_fields(
+    fields: dict[str, str | None],
+    locations: dict[str, list[dict[str, Any]]],
+) -> list[str]:
+    """校验 Rate/Charge 与 Total 是否落在货物行对应列上，位置不对就置空。
+
+    货物表格的这两列经常是空栏，模型会把下方费用区（Weight Charge、
+    Total Prepaid 等）或品名栏（DIMS ... x 1）里的数字当成单价/总价。
+    用定位结果兜底：不在计费重量右侧、或不同行，就视为空栏并清掉模型值。
+    """
+
+    anchor_boxes = locations.get("jfweight") or []
+    if not anchor_boxes:
+        return []
+    anchor = anchor_boxes[0]
+    anchor_x, anchor_y, _anchor_w, anchor_h = anchor["bbox"]
+
+    warnings: list[str] = []
+    for key in CHARGE_COLUMN_KEYS:
+        boxes = locations.get(key) or []
+        if not boxes or not fields.get(key):
+            continue
+        box = boxes[0]
+        x, y, _w, h = box["bbox"]
+        same_page = box["page"] == anchor["page"]
+        same_row = (
+            y < anchor_y + anchor_h + CHARGE_ROW_SLACK
+            and y + h > anchor_y - CHARGE_ROW_SLACK
+        )
+        if same_page and same_row and x > anchor_x:
+            continue
+        fields[key] = None
+        locations.pop(key, None)
+        warnings.append(f"{FIELD_LABELS.get(key, key)}栏为空，已置空")
+    return warnings
+
+
+def _text_layer_usable(text: str, min_chars: int) -> bool:
+    """文本层是否可用于分类。
+
+    扫描件的文本层常常只有零散数字或表头碎片（字符数够但没有单证标签），
+    这类页面继续用文本层会把分类带偏，应交给视觉模型逐字转写。
+    """
+
+    stripped = text.strip()
+    if len(stripped) < min_chars:
+        return False
+    upper = stripped.upper()
+    return any(label in upper for label in DOC_TEXT_LABELS)
 
 
 class PipelineError(RuntimeError):
@@ -68,6 +150,8 @@ class Pipeline:
         self.store = store
         self.gateway = gateway
         self.registry = build_default_registry()
+        # 由 TaskService 注入共享闸门；独立使用（测试）时退回自带实例
+        self.gates = ConcurrencyGates()
 
     # ------------------------------------------------------------------ 1
     async def render_document(self, state: AnalysisState) -> dict[str, Any]:
@@ -108,9 +192,19 @@ class Pipeline:
             out_dir = self.store.task_dir(task_id) / f"src{file_index:02d}"
             out_dir.mkdir(parents=True, exist_ok=True)
             try:
-                parsed = await asyncio.to_thread(
-                    parser.parse, source, out_dir, self.settings
-                )
+                # 渲染/转换是同步阻塞调用：丢线程池，避免卡住事件循环；
+                # Office 转换再加一层闸门，LibreOffice 单实例不能并行
+                if source.suffix.lower() in OFFICE_SUFFIXES:
+                    async with self.gates.acquire(
+                        "office", self.settings.office_concurrency
+                    ):
+                        parsed = await asyncio.to_thread(
+                            parser.parse, source, out_dir, self.settings
+                        )
+                else:
+                    parsed = await asyncio.to_thread(
+                        parser.parse, source, out_dir, self.settings
+                    )
             except ParserError as exc:
                 raise PipelineError(exc.code, f"{item['name']}：{exc.message}") from exc
             if not parsed.pages:
@@ -181,7 +275,9 @@ class Pipeline:
             if page.image_rel
             and (
                 self.settings.force_vlm
-                or len(page.text.strip()) < self.settings.text_layer_min_chars
+                or not _text_layer_usable(
+                    page.text, self.settings.text_layer_min_chars
+                )
             )
         ]
         warnings: list[str] = []
@@ -193,7 +289,8 @@ class Pipeline:
                 28,
             )
 
-        semaphore = asyncio.Semaphore(2)
+        # 逐页转写并发度可配；实际还会再受模型总闸门 model_max_concurrency 限制
+        semaphore = asyncio.Semaphore(self.settings.vision_page_concurrency)
 
         async def transcribe(page: PageRecord) -> None:
             async with semaphore:
@@ -352,19 +449,27 @@ class Pipeline:
             len(item.page_indexes) for item in segments if item.kind == "manifest"
         )
         if house_count == 0:
-            if not master_bills:
+            if master_bills:
+                warnings.append(
+                    "文件只包含主单，已跳过字段抽取；请补充分单（HAWB）与舱单后再提交"
+                )
+                hint = f"主单 {len(master_bills)} 份"
+            elif manifest_pages:
+                warnings.append(
+                    "文件只包含舱单，已跳过字段抽取；请补充分单（HAWB）后再提交"
+                )
+                hint = f"舱单 {manifest_pages} 页"
+            else:
                 self._save_segments(task_id, segments, master_bills, warnings, pages)
                 raise PipelineError(
-                    "NO_HOUSE_BILL",
-                    "未识别到任何分单页面。请确认文件包含分单（HAWB），或检查扫描件是否清晰",
+                    "NO_DOCUMENT",
+                    "未识别到主单、分单或舱单，请上传正确的单证文件",
                 )
-            # 只有主单的文件：按业务规则跳过抽取，任务本身仍算成功
-            warnings.append("文件只包含主单，已按规则跳过字段抽取，未发现分单")
             self._save_segments(task_id, segments, master_bills, warnings, pages)
             await self._emit(
                 state,
                 "识别主单/分单/舱单",
-                f"主单 {len(master_bills)} 份（已跳过抽取）、未发现分单",
+                f"{hint}，未发现分单，已跳过字段抽取",
                 52,
                 "warning",
             )
@@ -435,6 +540,15 @@ class Pipeline:
                         self.gateway, pages, segment.page_indexes
                     )
                     fields = result["fields"]
+                    # 港口归一前先记下页面原文：定位时要用原文（如 SHANGHAI PUDONG...），
+                    # 用归一后的三字码（PVG）会在页面上搜到别处的大字代码
+                    field_sources = {
+                        key: str(fields.get(key)).strip()
+                        for key in ("sfg", "mdg")
+                        if fields.get(key)
+                    }
+                    # 港口只接受三字码：确定不了就留空，原文留给待审核
+                    field_evidence = normalize_port_fields(fields)
                     bill_warnings = result["warnings"]
                     confidence = result["confidence"]
                 except (ModelCallFailedError, ExtractionError) as exc:
@@ -448,11 +562,22 @@ class Pipeline:
                     )
                 finally:
                     finished += 1
+                field_locations = self._locate_segment_fields(
+                    task_id, pages, segment.page_indexes, fields, field_sources
+                )
+                # 计价列靠版面位置兜底：空栏时模型容易把别处的数字填进来
+                bill_warnings = [
+                    *bill_warnings,
+                    *_drop_unreliable_charge_fields(fields, field_locations),
+                ]
                 return HouseBill(
                     bill_id=f"bill_{index:03d}",
                     segment_id=segment.segment_id,
                     page_indexes=segment.page_indexes,
                     fields=fields,
+                    field_locations=field_locations,
+                    field_evidence=field_evidence,
+                    field_sources=field_sources,
                     confidence=confidence,
                     warnings=bill_warnings,
                     source_excerpt=self._excerpt(pages, segment.page_indexes),
@@ -481,21 +606,30 @@ class Pipeline:
             )
             try:
                 result = await extract_manifest(self.gateway, pages, page_indexes)
-                entries = [
-                    ManifestEntry(
-                        entry_id=f"mft_{position:04d}",
-                        line_no=entry["line_no"] or position,
-                        page_indexes=page_indexes,
-                        fields=entry["fields"],
-                        confidence=entry["confidence"],
-                        warnings=entry["warnings"],
+                entries = []
+                for position, entry in enumerate(result["entries"], start=1):
+                    entry_fields = entry["fields"]
+                    entries.append(
+                        ManifestEntry(
+                            entry_id=f"mft_{position:04d}",
+                            line_no=entry["line_no"] or position,
+                            page_indexes=page_indexes,
+                            fields=entry_fields,
+                            field_locations=self._locate_manifest_fields(
+                                task_id, pages, page_indexes, entry_fields
+                            ),
+                            confidence=entry["confidence"],
+                            warnings=entry["warnings"],
+                        )
                     )
-                    for position, entry in enumerate(result["entries"], start=1)
-                ]
+                master_payload = result.get("master")
                 manifest_document = ManifestDocument(
                     segment_id=manifest_segments[0].segment_id,
                     page_indexes=page_indexes,
                     entries=entries,
+                    master=(
+                        ManifestMaster(**master_payload) if master_payload else None
+                    ),
                     warnings=result["warnings"],
                 )
                 if not entries:
@@ -538,6 +672,7 @@ class Pipeline:
         if cached:
             return {
                 "comparisons": cached.get("comparisons", []),
+                "totals_checks": cached.get("totals_checks", []),
                 "summary": cached.get("summary", {}),
                 "warnings": [*state.get("warnings", []), *cached.get("warnings", [])],
             }
@@ -548,10 +683,13 @@ class Pipeline:
         )
         house_bills = list(state.get("house_bills") or [])
         comparisons, summary, compare_warnings = compare(house_bills, manifest)
+        totals = compare_totals(house_bills, manifest)
         warnings = [*(state.get("warnings") or []), *compare_warnings]
+        totals_failed = [item for item in totals if item.status != "match"]
 
         payload = {
             "comparisons": [item.model_dump() for item in comparisons],
+            "totals_checks": [item.model_dump() for item in totals],
             "summary": summary.model_dump(),
             "warnings": compare_warnings,
         }
@@ -560,12 +698,13 @@ class Pipeline:
             state,
             "核对分单与舱单",
             f"核对完成：一致 {summary.consistent} 份、不一致 {summary.inconsistent} 份、"
-            f"信息不全 {summary.incomplete} 份",
+            f"信息不全 {summary.incomplete} 份、汇总差异 {len(totals_failed)} 项",
             92,
-            "warning" if summary.inconsistent else "info",
+            "warning" if summary.inconsistent or totals_failed else "info",
         )
         return {
             "comparisons": payload["comparisons"],
+            "totals_checks": payload["totals_checks"],
             "summary": payload["summary"],
             "warnings": warnings,
         }
@@ -573,17 +712,27 @@ class Pipeline:
     # ------------------------------------------------------------------ 6
     async def build_result(self, state: AnalysisState) -> dict[str, Any]:
         task_id = state["task_id"]
+        # 没有分单时图会跳过抽取与核对节点，这里补一条"已跳过"事件供前端展示
+        if not any(
+            item.get("kind") == "house_bill" for item in state.get("segments") or []
+        ):
+            for label in ("抽取分单与舱单字段", "核对分单与舱单"):
+                await self._emit(state, label, "无分单，已跳过", 0, phase="skipped")
         pages = [PageRecord(**item) for item in state.get("pages") or []]
         house_bills = [HouseBill(**item) for item in state.get("house_bills") or []]
         manifest = ManifestDocument(**state["manifest"]) if state.get("manifest") else None
         comparisons = [
             HouseBillComparison(**item) for item in state.get("comparisons") or []
         ]
+        totals_checks = [
+            TotalsCheck(**item) for item in state.get("totals_checks") or []
+        ]
         review_items = build_review_items(
             house_bills,
             comparisons,
             manifest,
             self.settings.review_confidence_threshold,
+            totals_checks,
         )
         result = AnalysisResult(
             task_id=task_id,
@@ -600,6 +749,7 @@ class Pipeline:
             house_bills=house_bills,
             manifest=manifest,
             comparisons=comparisons,
+            totals_checks=totals_checks,
             summary=ComparisonSummary(**state.get("summary") or {}),
             review_items=review_items,
             warnings=_unique(state.get("warnings") or []),
@@ -624,10 +774,15 @@ class Pipeline:
         message: str,
         progress: int,
         level: str = "info",
+        *,
+        phase: str = "",
+        duration_ms: int | None = None,
     ) -> None:
         reporter = state.get("reporter")
         if reporter is not None:
-            await reporter.emit(step, message, progress, level)  # type: ignore[arg-type]
+            await reporter.emit(
+                step, message, progress, level, phase=phase, duration_ms=duration_ms  # type: ignore[arg-type]
+            )
 
     def _save_pages(
         self,
@@ -668,6 +823,78 @@ class Pipeline:
                 "warnings": warnings,
                 "pages": [page.model_dump() for page in pages],
             },
+        )
+
+    def _resolve_source_pdf(self, task_id: str, source_file: str | None) -> Path | None:
+        """定位源文件对应的 PDF：原件是 PDF 直接用，Office 用转换后的 PDF。"""
+
+        name = Path(source_file or "").name
+        if not name:
+            return None
+        task_dir = self.store.task_dir(task_id)
+        original = task_dir / name
+        if original.suffix.lower() == ".pdf" and original.exists():
+            return original
+        stem = Path(name).stem
+        for sub_dir in sorted(task_dir.glob("src*")):
+            converted = sub_dir / f"{stem}.pdf"
+            if converted.exists():
+                return converted
+        return None
+
+    def _locate_segment_fields(
+        self,
+        task_id: str,
+        pages: list[PageRecord],
+        page_indexes: list[int],
+        fields: dict[str, str | None],
+        sources: dict[str, str] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """在分单所在 PDF 中定位字段值，供前端点击字段时高亮。"""
+
+        by_index = {page.index: page for page in pages}
+        first = by_index.get(page_indexes[0]) if page_indexes else None
+        if first is None:
+            return {}
+        pdf_path = self._resolve_source_pdf(task_id, first.source_file)
+        if pdf_path is None:
+            return {}
+        page_map: dict[int, int] = {}
+        for index in page_indexes:
+            page = by_index.get(index)
+            if page is None or page.source_file != first.source_file:
+                continue
+            page_map[index] = page.page_in_file or index
+        # 定位优先用页面原文（港口归一成三字码后，原文才是页面上真实存在的内容）
+        lookup = {
+            key: (sources or {}).get(key) or value
+            for key, value in fields.items()
+        }
+        return locate_fields(pdf_path, page_map, lookup)
+
+    def _locate_manifest_fields(
+        self,
+        task_id: str,
+        pages: list[PageRecord],
+        page_indexes: list[int],
+        fields: dict[str, str | None],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """舱单行定位：以分单号锚定行，再在行内定位其他字段。"""
+
+        by_index = {page.index: page for page in pages}
+        first = by_index.get(page_indexes[0]) if page_indexes else None
+        if first is None:
+            return {}
+        pdf_path = self._resolve_source_pdf(task_id, first.source_file)
+        if pdf_path is None:
+            return {}
+        page_map = {
+            index: by_index[index].page_in_file
+            for index in page_indexes
+            if index in by_index and by_index[index].source_file == first.source_file
+        }
+        return locate_manifest_fields(
+            pdf_path, page_map, fields, anchor=fields.get("hawb_no")
         )
 
     @staticmethod

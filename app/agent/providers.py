@@ -7,13 +7,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
-from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 from app.config import Settings
+
+if TYPE_CHECKING:
+    from langchain_openai import ChatOpenAI
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,10 @@ class ModelProvider:
     extra_body: dict[str, Any] | None = None
 
     def build_chat_model(self, *, vision: bool = False) -> ChatOpenAI:
+        # langchain_openai 会连带加载整个 openai SDK（约 1s），只在真正调用模型时导入，
+        # 避免每次重启服务都为它付出启动耗时
+        from langchain_openai import ChatOpenAI
+
         return ChatOpenAI(
             api_key=SecretStr(self.api_key),
             base_url=self.base_url,

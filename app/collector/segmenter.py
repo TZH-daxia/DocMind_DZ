@@ -26,6 +26,8 @@ MASTER_LABEL_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"\bMAWB\b",
+        # 单证标题：Air Waybill（主单常见；"HOUSE AIR WAYBILL" 会在 detect_master_bill 里先行排除）
+        r"\bAIR\s+WAYBILL\b",
         r"MASTER\s+AIR\s+WAYBILL",
         r"MASTER\s+AWB\b",
         r"MASTER\s+WAYBILL",
@@ -318,8 +320,11 @@ def _has_manifest_title(head: str) -> bool:
         stripped = line.strip()
         if not stripped or re.search(r"AS\s+PER|ATTACHED|PER\s+ATTACHED", stripped, re.I):
             continue
+        # 允许行首出现表格分隔符（Excel 转出的文本常见 "| | CARGO MANIFEST"）
         if re.match(
-            r"^(?:(?:CARGO|AIR|FREIGHT|CONSOL)\s+)*MANIFEST\b", stripped, re.IGNORECASE
+            r"^\W*(?:(?:CARGO|AIR|FREIGHT|CONSOL)\s+)*MANIFEST\b",
+            stripped,
+            re.IGNORECASE,
         ):
             return True
         if re.match(r"^(?:\S{0,8})?舱单", stripped) or stripped in {"舱单", "装载清单", "载货清单"}:
@@ -345,7 +350,7 @@ def _score_manifest(text: str, head: str) -> int:
         score += 2
     if re.search(r"TOTAL\s+WEIGHT|TOTAL\s+VOLUME", text, re.IGNORECASE):
         score += 1
-    if re.search(r"PAGE\s+\d+\s+OF\s+\d+", text, re.IGNORECASE):
+    if re.search(r"PAGE\s*(?:NO\.?)?\s*\d+\s*(?:OF|/)\s*\d+", text, re.IGNORECASE):
         score += 1
     if re.search(r"\bMANIFEST\b|舱单", text, re.IGNORECASE):
         score += 1

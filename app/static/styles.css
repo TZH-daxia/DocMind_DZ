@@ -14,6 +14,9 @@
   --amber-soft: #fff1dc;
   --red: #c55755;
   --red-soft: #fbe8e7;
+  /* 主品牌蓝：与弹窗内 --blue 同一个蓝，logo、英文小标题、主要按钮统一用它 */
+  --brand: #3b85fb;
+  --brand-strong: #2a6fe0;
   --shadow: 0 18px 40px rgba(28, 45, 57, 0.08);
   --sans: "Avenir Next", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
   --mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
@@ -85,7 +88,7 @@ textarea {
   display: grid;
   place-items: center;
   border-radius: 8px 8px 8px 2px;
-  background: var(--teal);
+  background: var(--brand);
   color: #fff;
   font-family: var(--mono);
   font-size: 12px;
@@ -135,8 +138,8 @@ textarea {
 }
 
 .icon-button:hover {
-  color: var(--teal);
-  border-color: var(--teal);
+  color: var(--brand);
+  border-color: var(--brand);
 }
 
 .workspace {
@@ -178,7 +181,7 @@ textarea {
 }
 
 .eyebrow {
-  color: var(--teal);
+  color: var(--brand);
   font-size: 9.5px;
   font-weight: 800;
   letter-spacing: 0.16em;
@@ -368,8 +371,19 @@ textarea {
   background: var(--amber);
 }
 
+/* 0 分单：任务成功但没有任何可提交内容，用黄色区分 */
+.status-dot.warn {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(198, 128, 47, 0.14);
+}
+
 .status-dot.failed {
   background: var(--red);
+}
+
+/* 已取消是用户主动操作，用中性灰与「失败」区分 */
+.status-dot.cancelled {
+  background: #b6c2c9;
 }
 
 .file-panel-foot {
@@ -428,6 +442,11 @@ textarea {
   color: #a74442;
 }
 
+.status-pill.cancelled {
+  background: #edf2f4;
+  color: #5a6b73;
+}
+
 .status-pill.running {
   background: var(--amber-soft);
   color: #8a5b1e;
@@ -452,8 +471,8 @@ textarea {
 }
 
 .secondary-button:hover:not(:disabled) {
-  border-color: var(--teal);
-  color: var(--teal);
+  border-color: var(--brand);
+  color: var(--brand);
 }
 
 .secondary-button:disabled {
@@ -462,13 +481,13 @@ textarea {
 }
 
 .prepare-button:not(:disabled) {
-  border-color: var(--teal);
-  background: var(--teal);
+  border-color: var(--brand);
+  background: var(--brand);
   color: #fff;
 }
 
 .prepare-button:not(:disabled):hover {
-  background: #0e8a80;
+  background: var(--brand-strong);
   color: #fff;
 }
 
@@ -836,6 +855,24 @@ textarea {
   -webkit-box-orient: vertical;
 }
 
+.result-notice {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(217, 164, 65, 0.42);
+  border-radius: 6px;
+  background: rgba(217, 164, 65, 0.12);
+  color: #8a5b1e;
+  font-size: 11.5px;
+}
+
+.result-notice strong {
+  font-size: 12px;
+}
+
 .result-error {
   grid-column: 1 / -1;
   border: 1px solid rgba(197, 90, 75, 0.32);
@@ -990,6 +1027,99 @@ textarea {
   border-color: rgba(197, 90, 75, 0.5);
 }
 
+/* 弹窗顶部：最近完成任务的页签（与 docmind 一致的蓝色/绿色渐变两态） */
+.doc-file-tabs {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 10px 18px 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  overflow-x: auto;
+  overflow-y: hidden;
+  /* 选中项盖住下方分隔线，做成贴底页签 */
+  margin-bottom: -1px;
+}
+
+.doc-file-tabs::-webkit-scrollbar {
+  height: 6px;
+}
+
+.doc-file-tabs::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 3px;
+}
+
+.doc-file-tab {
+  flex: 0 1 200px;
+  min-width: 150px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 12px;
+  border: none;
+  border-radius: 8px 8px 0 0;
+  background: linear-gradient(
+    90deg,
+    rgba(59, 133, 251, 0.2) 0%,
+    rgba(99, 159, 255, 0.2) 100%
+  );
+  color: var(--blue);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+
+.doc-file-tab:hover {
+  background: linear-gradient(
+    90deg,
+    rgba(59, 133, 251, 0.32) 0%,
+    rgba(99, 159, 255, 0.32) 100%
+  );
+}
+
+.doc-file-tab.is-active {
+  background: linear-gradient(90deg, var(--blue) 0%, #639fff 100%);
+  color: #fff;
+}
+
+/* 已提交：浅绿（未选中）/ 深绿（选中），与蓝色两态一一对应 */
+.doc-file-tab.is-submitted {
+  background: linear-gradient(
+    90deg,
+    rgba(22, 177, 52, 0.2) 0%,
+    rgba(15, 192, 49, 0.2) 100%
+  );
+  color: #16b134;
+}
+
+.doc-file-tab.is-submitted:hover {
+  background: linear-gradient(
+    90deg,
+    rgba(22, 177, 52, 0.32) 0%,
+    rgba(15, 192, 49, 0.32) 100%
+  );
+}
+
+.doc-file-tab.is-submitted.is-active {
+  background: linear-gradient(90deg, #16b134 0%, #0fc031 100%);
+  color: #fff;
+}
+
+.doc-file-tab-icon {
+  flex: none;
+  font-weight: 700;
+}
+
+.doc-file-tab-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .doc-dialog-body {
   flex: 1;
   min-height: 0;
@@ -1013,11 +1143,20 @@ textarea {
   flex: none;
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
   gap: 12px;
   padding: 0 18px;
   border-bottom: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.65);
+}
+
+/* 预览区左上角小标：与 docmind 一致（黑色、10px、字距放大、全大写） */
+.doc-preview-eyebrow {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #000;
 }
 
 .doc-preview-tools {
@@ -1091,12 +1230,29 @@ textarea {
 }
 
 .doc-page-inner {
+  position: relative;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: #fff;
   box-shadow: 0 8px 20px rgba(28, 45, 57, 0.08);
   overflow: hidden;
   transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+/* 点击已提取字段时叠加在原图上的定位框（坐标由后端归一化给出） */
+.doc-locate-box {
+  position: absolute;
+  z-index: 2;
+  border: 2px solid #d99a2b;
+  border-radius: 3px;
+  background: rgba(217, 154, 43, 0.16);
+  box-shadow: 0 0 0 3px rgba(217, 154, 43, 0.12);
+  pointer-events: none;
+}
+
+.doc-page.is-located .doc-page-inner {
+  border-color: #d99a2b;
+  box-shadow: 0 0 0 3px rgba(217, 154, 43, 0.18);
 }
 
 .doc-page-inner img {
@@ -1146,18 +1302,34 @@ textarea {
 
 .doc-tabs {
   flex: none;
+  /* 与左侧 SOURCE DOCUMENT 栏同高：底部线与预览区标题栏对齐 */
+  height: 48px;
+  box-sizing: border-box;
   display: flex;
   align-items: flex-end;
   gap: 4px;
-  padding: 10px 16px 0;
+  padding: 12px 16px 0;
   border-bottom: 1px solid var(--line);
+  /* 只允许左右滚动：避免 Windows 下同时冒出一条竖直滚动条 */
   overflow-x: auto;
+  overflow-y: hidden;
   background: #fbfcfd;
 }
 
+.doc-tabs::-webkit-scrollbar {
+  height: 6px;
+}
+
+.doc-tabs::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 3px;
+}
+
 .doc-tab {
-  flex: 0 1 152px;
-  min-width: 108px;
+  /* 固定宽度、不收缩：分单多到超出面板时出现左右滑动条 */
+  flex: 0 0 auto;
+  min-width: 132px;
+  max-width: 200px;
   height: 36px;
   display: flex;
   align-items: center;
@@ -1187,6 +1359,16 @@ textarea {
   background: linear-gradient(90deg, rgba(19, 156, 145, 0.18), rgba(19, 156, 145, 0.12));
   border-color: rgba(19, 156, 145, 0.3);
   color: #0e796e;
+}
+
+/* 舱单页签红点：存在未校验或差异字段，进入舱单后消失 */
+.doc-tab-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-left: 2px;
+  border-radius: 50%;
+  background: var(--red);
 }
 
 .doc-tab.is-submitted.is-active {
@@ -1425,6 +1607,25 @@ textarea {
   color: var(--amber);
 }
 
+/* 缺值导致没有完成校验的舱单字段 */
+.doc-badge.unchecked {
+  background: #eef2f5;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.doc-hint.unchecked {
+  color: var(--muted);
+  font-style: normal;
+}
+
+/* 待审核字段的原文引用（类似 docmind 的「原文：…」） */
+.doc-hint.evidence {
+  color: #7b6a45;
+  font-style: italic;
+  word-break: break-word;
+}
+
 .doc-required {
   color: var(--red);
   font-style: normal;
@@ -1477,7 +1678,8 @@ textarea {
   line-height: 1.25;
   word-break: normal;
   overflow-wrap: break-word;
-  cursor: pointer;
+  /* 标签只用于显示：点击标签或其周围空白不再把焦点跳到输入框 */
+  cursor: default;
 }
 
 .awb-cell .doc-input {
@@ -1892,7 +2094,7 @@ textarea {
   padding: 0 24px;
   border: 0;
   border-radius: 8px;
-  background: #dd9e4c;
+  background: var(--brand);
   color: #fff;
   font-size: 13.5px;
   font-weight: 600;
@@ -1901,7 +2103,7 @@ textarea {
 }
 
 .doc-submit:hover:not(:disabled) {
-  background: #cf8f3f;
+  background: var(--brand-strong);
 }
 
 .doc-submit:disabled {

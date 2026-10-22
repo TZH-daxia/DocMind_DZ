@@ -4,8 +4,9 @@
 - 所有格式都产出 `ParsedDocument`，下游管线只认页面，不再关心文件后缀；
 - PDF 同时保留文本层与页面图片：有可靠文本层时直接用文本（快且准），
   扫描件/文本层缺失时由管线调用 VLM 转写；
-- Word/Excel 直接抽结构化文本（表格按行输出），不依赖 LibreOffice；
-- .doc/.xls 旧格式在安装了 LibreOffice 时先转 PDF，否则明确报错。
+- Word/Excel 优先用 LibreOffice 转 PDF，再复用 PDF 解析器（有页图、文本层一致）；
+  LibreOffice 不可用时回退 python-docx / openpyxl / xlrd 的纯文本解析；
+- 图片文件（png/jpg 等）暂不支持，上传时按不支持类型拒绝。
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -236,72 +236,82 @@ class XlsParser:
         return document
 
 
-class ImageParser:
-    name = "image"
-    extensions = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+def _libreoffice_binary() -> str | None:
+    """定位 LibreOffice 可执行文件（PATH 优先，其次常见安装位置）。"""
+
+    found = shutil.which("soffice") or shutil.which("libreoffice")
+    if found:
+        return found
+    for candidate in (
+        Path(r"C:\Program Files\LibreOffice\program\soffice.exe"),
+        Path(r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"),
+        Path("/Applications/LibreOffice.app/Contents/MacOS/soffice"),
+        Path("/usr/bin/soffice"),
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _office_to_pdf(source: Path, out_dir: Path) -> Path | None:
+    """用 LibreOffice headless 把 Office 文档转成 PDF；失败返回 None 由调用方回退。"""
+
+    binary = _libreoffice_binary()
+    if binary is None:
+        return None
+    command = [
+        binary,
+        "--headless",
+        "--norestore",
+        "--convert-to",
+        "pdf",
+        "--outdir",
+        str(out_dir),
+        str(source),
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, timeout=180)
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("Office 转 PDF 失败：%s（%s）", source.name, exc)
+        return None
+    target = out_dir / f"{source.stem}.pdf"
+    return target if target.exists() else None
+
+
+class OfficePdfParser:
+    """Office 文档（doc/docx/xls/xlsx）先转 PDF，再复用 PDF 解析器。
+
+    这样 Word/Excel 也有页面图片与文本层，左侧预览与 PDF 走同一条链路；
+    LibreOffice 不可用或转换失败时回退到纯文本解析（无页图）。
+    """
+
+    name = "office_pdf"
+    extensions = (".doc", ".docx", ".xls", ".xlsx")
 
     def parse(self, source: Path, out_dir: Path, settings: Settings) -> ParsedDocument:
-        try:
-            from PIL import Image
-        except ImportError as exc:  # pragma: no cover
-            raise ParserError("PARSER_UNAVAILABLE", "缺少 Pillow 依赖") from exc
+        suffix = source.suffix.lower()
+        if settings.office_render_enabled:
+            pdf_path = _office_to_pdf(source, out_dir)
+            if pdf_path is not None:
+                document = PdfParser().parse(pdf_path, out_dir, settings)
+                document.parser = f"{suffix.lstrip('.')}_pdf"
+                return document
 
-        document = ParsedDocument(parser="image")
-        try:
-            with Image.open(source) as image:
-                frames = getattr(image, "n_frames", 1)
-                for frame_index in range(min(frames, settings.max_pages)):
-                    if frames > 1:
-                        image.seek(frame_index)
-                    target = out_dir / f"page_{frame_index + 1:03d}.png"
-                    converted = image.convert("RGB")
-                    # 限制超长边，避免 1200 万像素手机照片直接喂模型
-                    converted.thumbnail((2600, 2600))
-                    converted.save(target, "PNG")
-                    document.pages.append(
-                        ParsedPage(index=frame_index + 1, text="", image_path=target)
-                    )
-                if frames > settings.max_pages:
-                    document.warnings.append(
-                        f"文件共 {frames} 页，仅解析前 {settings.max_pages} 页"
-                    )
-        except Exception as exc:  # noqa: BLE001
-            raise ParserError("PARSE_FAILED", f"图片解析失败：{exc}") from exc
-        return document
-
-
-class LegacyOfficeParser:
-    """`.doc` / `.xls`：借助 LibreOffice 转 PDF 后复用 PDF 解析器。"""
-
-    name = "legacy_office"
-    extensions = (".doc", ".xls")
-
-    def parse(self, source: Path, out_dir: Path, settings: Settings) -> ParsedDocument:
-        soffice = shutil.which("soffice") or shutil.which("libreoffice")
-        if not soffice:
+        if suffix == ".doc":
             raise ParserError(
                 "LEGACY_FORMAT_UNSUPPORTED",
-                "旧版 .doc/.xls 需要安装 LibreOffice 才能解析，请另存为 .docx/.xlsx 后重试",
+                "旧版 .doc 需要安装 LibreOffice 才能解析，请另存为 .docx 后重试",
             )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            command = [
-                soffice,
-                "--headless",
-                "--norestore",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                temp_dir,
-                str(source),
-            ]
-            try:
-                subprocess.run(command, check=True, capture_output=True, timeout=120)
-            except (subprocess.SubprocessError, OSError) as exc:
-                raise ParserError("PARSE_FAILED", f"LibreOffice 转换失败：{exc}") from exc
-            pdf_path = Path(temp_dir) / f"{source.stem}.pdf"
-            if not pdf_path.exists():
-                raise ParserError("PARSE_FAILED", "LibreOffice 未生成 PDF")
-            return PdfParser().parse(pdf_path, out_dir, settings)
+        fallback: DocumentParser
+        if suffix == ".docx":
+            fallback = DocxParser()
+        elif suffix == ".xlsx":
+            fallback = ExcelParser()
+        else:
+            fallback = XlsParser()
+        document = fallback.parse(source, out_dir, settings)
+        document.warnings.append("未启用或未安装 LibreOffice，已按纯文本解析，无页面图片")
+        return document
 
 
 class ParserRegistry:
@@ -330,11 +340,7 @@ class ParserRegistry:
 
 def build_default_registry() -> ParserRegistry:
     registry = ParserRegistry()
-    # 顺序有意义：.doc/.xls 必须由 LegacyOfficeParser 处理
-    registry.register(LegacyOfficeParser())
+    # Office 文档统一「转 PDF → 复用 PDF 解析器」，保证有页面图片；失败时解析器内部回退
+    registry.register(OfficePdfParser())
     registry.register(PdfParser())
-    registry.register(DocxParser())
-    registry.register(ExcelParser())
-    registry.register(XlsParser())
-    registry.register(ImageParser())
     return registry

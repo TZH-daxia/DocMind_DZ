@@ -11,6 +11,7 @@ import {
   MANIFEST_REQUIRED_KEYS,
   PARTY_GROUP_LABEL,
   REQUIRED_KEYS,
+  partyFieldKey,
 } from "./constants.js";
 import { esc, fmtDateTime, showToast, statusPill } from "./ui.js";
 
@@ -19,6 +20,8 @@ const ZOOM_STEPS = [1, 1.25, 1.5, 2, 3];
 const state = {
   result: null,
   snapshot: null,
+  // 弹窗顶部文件页签：最近完成的 5 个任务，可切换查看/提交
+  fileTabs: [],
   houseFields: DEFAULT_HOUSE_FIELDS,
   manifestFields: DEFAULT_MANIFEST_FIELDS,
   onSubmitted: null,
@@ -35,6 +38,9 @@ const state = {
 };
 
 let root = null;
+
+// 弹窗顶部最多显示的已完成任务数（与 docmind 一致）
+const MAX_FILE_TABS = 5;
 
 // ------------------------------------------------------------------ helpers
 
@@ -89,12 +95,17 @@ function activeTab() {
   return state.tabs.find((tab) => tab.id === state.activeTab) || state.tabs[0];
 }
 
-// 制单栏位与核对用通用栏位同源：旧结果只有 pieces/weight/volume 时直接复用
-const FIELD_FALLBACKS = {
-  rcp_pieces: "pieces",
-  rcp_gross_weight: "weight",
-  rcp_volume: "volume",
+// 核对结果仍按舱单口径的 key 输出，分单侧这几个字段名不同
+const COMPARISON_KEY_ALIASES = {
+  mdg: "dest_port",
+  zdpiece: "pieces",
+  zdweight: "weight",
+  jfweight: "chargeable_weight",
+  zdvolume: "volume",
 };
+const HOUSE_KEY_ALIASES = Object.fromEntries(
+  Object.entries(COMPARISON_KEY_ALIASES).map(([house, manifest]) => [manifest, house])
+);
 
 function originalValue(tab, key) {
   if (tab.type === "manifest") return null;
@@ -103,8 +114,7 @@ function originalValue(tab, key) {
   if (direct !== undefined && direct !== null && String(direct).trim() !== "") {
     return direct;
   }
-  const alias = FIELD_FALLBACKS[key];
-  return (alias && fields[alias]) ?? "";
+  return "";
 }
 
 function valueFor(tabId, key, fallback) {
@@ -121,7 +131,20 @@ function manifestValueFor(entryId, key, fallback) {
 
 function fieldStatus(comparison, key) {
   if (!comparison) return null;
-  return (comparison.fields || []).find((field) => field.key === key) || null;
+  const fields = comparison.fields || [];
+  return (
+    fields.find((field) => field.key === key) ||
+    fields.find((field) => field.key === COMPARISON_KEY_ALIASES[key]) ||
+    null
+  );
+}
+
+// 必填提示里显示字段中文名（分单 key 与舱单 key 都能查）
+function labelForKey(key) {
+  const spec =
+    houseCatalog().find((field) => field.key === key) ||
+    manifestCatalog().find((field) => field.key === key);
+  return spec ? spec.label : key;
 }
 
 function badgeFor(comparisonField) {
@@ -133,21 +156,15 @@ function badgeFor(comparisonField) {
   if (status === "similar") {
     return '<em class="doc-badge review">待审核</em>';
   }
-  if (status === "missing_in_manifest" || status === "missing_in_house_bill") {
-    return '<em class="doc-badge review">待审核</em>';
-  }
   return "";
 }
 
 function hintFor(comparisonField) {
   if (!comparisonField) return "";
   const { status, manifest_value: manifestValue, note, similarity } = comparisonField;
-  if (status === "match") return "";
-  if (status === "missing_in_manifest") {
-    return '<small class="doc-hint review">舱单中该字段为空</small>';
-  }
-  if (status === "missing_in_house_bill") {
-    return `<small class="doc-hint review">分单中该字段为空 · 舱单：${esc(manifestValue || "—")}</small>`;
+  // 空值不再提示：只有真实差异与文本近似需要人工看
+  if (status === "match" || status === "missing_in_manifest" || status === "missing_in_house_bill") {
+    return "";
   }
   if (status === "similar") {
     return `<small class="doc-hint review">舱单：${esc(
@@ -162,13 +179,31 @@ function hintFor(comparisonField) {
   return "";
 }
 
+// 低置信度/文本近似的字段：取待审核条目里的原文，显示在字段下方
+function reviewEvidence(tabId, key) {
+  const items = state.result?.review_items || [];
+  const found = items.find(
+    (item) => item.tab_id === tabId && item.key === key && item.evidence
+  );
+  return found ? found.evidence : "";
+}
+
+// 字段级待审核徽标（如港口无法确定三字码，等待人工填写）
+function reviewBadge(tabId, key) {
+  const items = state.result?.review_items || [];
+  const found = items.some(
+    (item) => item.tab_id === tabId && item.key === key && item.reason === "low_confidence"
+  );
+  return found ? '<em class="doc-badge review">待审核</em>' : "";
+}
+
 function buildTabs() {
   const billComparisons = comparisonsByBill();
   const tabs = (state.result.house_bills || []).map((bill, index) => ({
     id: bill.bill_id,
     type: "house_bill",
     label: `分单 ${index + 1}`,
-    sub: bill.fields?.hawb_no || "未识别分单号",
+    sub: bill.fields?.hawb || "未识别分单号",
     bill,
     comparison: billComparisons.get(bill.bill_id) || null,
     pageIndexes: bill.page_indexes || [],
@@ -193,8 +228,26 @@ function activeTabPages() {
 
 // ------------------------------------------------------------------ render
 
+// 舱单是否存在「未校验（缺值）」或「异常差异」字段
+function manifestHasAlerts() {
+  for (const item of state.result?.comparisons || []) {
+    if (!item.manifest_entry_id) continue;
+    for (const field of item.fields || []) {
+      if (
+        field.status === "mismatch" ||
+        field.status === "missing_in_manifest" ||
+        field.status === "missing_in_house_bill"
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function renderTabs() {
   const submitted = state.submitted;
+  const manifestAlert = manifestHasAlerts() && !state.manifestSeen;
   return `<div class="doc-tabs" role="tablist">
     ${state.tabs
       .map((tab) => {
@@ -202,12 +255,17 @@ function renderTabs() {
         const icon = submitted
           ? '<svg viewBox="0 0 24 24" class="doc-tab-check"><circle cx="12" cy="12" r="10.5"/><path d="M7.2 12.3l3.3 3.3 6.3-6.6"/></svg>'
           : "";
+        const dot =
+          tab.type === "manifest" && manifestAlert
+            ? '<i class="doc-tab-dot" aria-label="有未校验或差异字段"></i>'
+            : "";
         return `<button class="doc-tab${isActive ? " is-active" : ""}${
           submitted ? " is-submitted" : ""
         }" role="tab" aria-selected="${isActive}" data-tab="${esc(tab.id)}">
           ${icon}
           <span class="doc-tab-text">${esc(tab.label)}</span>
           <span class="doc-tab-sub">${esc(tab.sub)}</span>
+          ${dot}
         </button>`;
       })
       .join("")}
@@ -250,42 +308,36 @@ function houseCell(tab, comparison, key, label, pos = {}, scope = "row") {
         </button>
       </div>`
     : field;
+  const evidence = reviewEvidence(tab.id, key);
   // 用 div 包裹、label 只绑定文字，避免点击单元格空白处就聚焦输入框
   return `<div class="${classes.join(" ")}" style="${position}" data-row="${esc(
     tab.id
   )}:${esc(key)}">
-      <label class="awb-cell-label" for="${esc(inputId)}">${esc(label).replaceAll(
+      <span class="awb-cell-label">${esc(label).replaceAll(
         "/",
         "/<wbr>"
       )}${required}
-        <span class="doc-markers">${badgeFor(comparisonField)}</span>
-      </label>
+        <span class="doc-markers">${badgeFor(comparisonField)}${reviewBadge(tab.id, key)}</span>
+      </span>
       ${control}
       ${hintFor(comparisonField)}
+      ${evidence ? `<small class="doc-hint evidence">原文：${esc(evidence)}</small>` : ""}
     </div>`;
 }
 
-// 分单摘要：单号、核对状态、页码/舱单行/置信度
-function houseMeta(tab, comparison) {
-  const meta = [];
-  if (tab.pageIndexes.length) meta.push(`第 ${tab.pageIndexes.join("、")} 页`);
-  if (comparison?.manifest_line_no) meta.push(`舱单第 ${comparison.manifest_line_no} 行`);
-  if (comparison && comparison.manifest_entry_id === null) meta.push("舱单未匹配");
-  meta.push(`置信度 ${Math.round((tab.bill.confidence || 0) * 100)}%`);
-  return meta;
-}
-
 function renderHouseInfo(tab, comparison) {
-  const statusInfo = comparison
-    ? BILL_STATUS[comparison.status] || BILL_STATUS.incomplete
-    : BILL_STATUS.incomplete;
-  const meta = houseMeta(tab, comparison);
+  // 只标「不一致」；一致与缺值都不再显示标记
+  const statusInfo =
+    comparison && comparison.status === "inconsistent"
+      ? BILL_STATUS.inconsistent
+      : null;
+  // 不再展示分单号与页码：置信度占据原分单号的位置，字号与标记保持一致
+  const confidence = Math.round((tab.bill.confidence || 0) * 100);
   return `<div class="awb-row-info" style="--col:1;--span:8">
       <div class="awb-info-head">
-        <span class="awb-info-no">${esc(tab.sub)}</span>
-        ${statusPill(statusInfo.label, statusInfo.className)}
+        <span class="awb-info-no">置信度 ${confidence}%</span>
+        ${statusInfo ? statusPill(statusInfo.label, statusInfo.className) : ""}
       </div>
-      <div class="awb-info-meta">${meta.map((item) => esc(item)).join(" · ")}</div>
     </div>`;
 }
 
@@ -296,7 +348,7 @@ function renderHouseRow(tab, comparison, row) {
   if (row.party) {
     const cells = row.fields
       .map((item) => {
-        const key = `${row.party}_${item.key}`;
+        const key = partyFieldKey(row.party, item.key);
         const spec = fieldByKey(catalog, key);
         if (!spec) return "";
         return houseCell(tab, comparison, key, item.label || spec.label, item, "party");
@@ -344,9 +396,13 @@ function renderManifestForm(tab) {
   const cards = entries
     .map((entry) => {
       const comparison = entryComparisons.get(entry.entry_id);
-      const statusInfo = comparison
-        ? BILL_STATUS[comparison.status] || BILL_STATUS.incomplete
-        : { label: "无对应分单", className: "idle" };
+      // 只标「不一致」与「无对应分单」；一致、缺值都不再显示标记
+      const statusInfo =
+        comparison === undefined
+          ? { label: "无对应分单", className: "idle" }
+          : comparison.status === "inconsistent"
+            ? BILL_STATUS.inconsistent
+            : null;
       const fields = manifestGroups()
         .flatMap((group) => group.fields)
         .map((field) => {
@@ -356,6 +412,17 @@ function renderManifestForm(tab) {
             ? fieldStatus(comparison, field.key)
             : null;
           const errorKey = `manifest:${entry.entry_id}:${field.key}`;
+          // 分单或舱单缺值 → 该字段没有完成校验，只在舱单侧标「未校验」
+          const unchecked =
+            comparisonField?.status === "missing_in_manifest" ||
+            comparisonField?.status === "missing_in_house_bill";
+          // 说明缺的是哪一侧：舱单没有值 or 分单没有值
+          const uncheckedHint =
+            comparisonField?.status === "missing_in_manifest"
+              ? '<small class="doc-hint unchecked">舱单缺少该字段，未校验</small>'
+              : comparisonField?.status === "missing_in_house_bill"
+                ? '<small class="doc-hint unchecked">分单缺少该字段，未校验</small>'
+                : "";
           const rowClass = [
             comparisonField?.status === "mismatch" ? "is-diff" : "",
             state.errors.has(errorKey) ? "has-error" : "",
@@ -369,19 +436,19 @@ function renderManifestForm(tab) {
               MANIFEST_REQUIRED_KEYS.includes(field.key)
                 ? '<i class="doc-required">*</i>'
                 : ""
-            }</span>
+            }${unchecked ? '<em class="doc-badge unchecked">未校验</em>' : ""}</span>
             <input class="doc-input" data-manifest-entry="${esc(
               entry.entry_id
             )}" data-key="${esc(field.key)}" value="${esc(value)}"${disabled} />
             ${hintFor(comparisonField)}
+            ${uncheckedHint}
           </label>`;
         })
         .join("");
       return `<article class="mft-entry">
         <header>
           <span class="mft-line">第 ${entry.line_no ?? "—"} 行</span>
-          <b>${esc(entry.fields?.hawb_no || "未识别分单号")}</b>
-          ${statusPill(statusInfo.label, statusInfo.className)}
+          ${statusInfo ? statusPill(statusInfo.label, statusInfo.className) : ""}
         </header>
         <div class="mft-grid">${fields}</div>
       </article>`;
@@ -391,7 +458,6 @@ function renderManifestForm(tab) {
   return `<div class="doc-form-head">
       <div class="doc-form-title">舱单</div>
       ${statusPill(`${entries.length} 行`, "idle")}
-      <div class="doc-form-meta">第 ${(tab.pageIndexes || []).join("、")} 页 · 逐行核对</div>
     </div>
     <div class="doc-form-scroll mft-scroll">${cards}</div>`;
 }
@@ -426,6 +492,7 @@ function renderPreview() {
     .join("");
 
   return `<header class="doc-preview-head">
+      <span class="doc-preview-eyebrow">SOURCE DOCUMENT</span>
       <div class="doc-preview-tools">
         <small>共 ${pages.length} 页</small>
         <div class="doc-zoom">
@@ -440,6 +507,122 @@ function renderPreview() {
     <div class="doc-preview-body" id="docPreviewBody">
       <div class="doc-pages" style="--doc-zoom:${zoom}">${figures}</div>
     </div>`;
+}
+
+// ---------------------------------------------------------------- field locate
+
+function clearFieldHighlight() {
+  root?.querySelectorAll(".doc-locate-box").forEach((node) => node.remove());
+  root
+    ?.querySelectorAll(".doc-page.is-located")
+    .forEach((node) => node.classList.remove("is-located"));
+}
+
+// 滚动到指定页；给了 box 就滚到框中心（放大/缩小时按页面实时尺寸重算）
+function scrollPreviewToBox(pageIndex, box) {
+  const body = root?.querySelector("#docPreviewBody");
+  const page = root?.querySelector(`.doc-page[data-page="${pageIndex}"]`);
+  if (!body || !page) return null;
+
+  const doScroll = () => {
+    const inner = page.querySelector(".doc-page-inner") || page;
+    const bodyRect = body.getBoundingClientRect();
+    const innerRect = inner.getBoundingClientRect();
+    const bbox = box?.bbox || [0.5, 0.5, 0, 0];
+    const centerX =
+      innerRect.left - bodyRect.left + (bbox[0] + bbox[2] / 2) * innerRect.width;
+    const centerY =
+      innerRect.top - bodyRect.top + (bbox[1] + bbox[3] / 2) * innerRect.height;
+    body.scrollTo({
+      left: Math.max(0, body.scrollLeft + centerX - body.clientWidth / 2),
+      top: Math.max(0, body.scrollTop + centerY - body.clientHeight / 2),
+      behavior: "smooth",
+    });
+  };
+
+  const image = page.querySelector("img");
+  // 图片未加载完时页面高度为 0，滚动会落空：等首图加载后再定位
+  if (image && !image.complete) {
+    image.addEventListener("load", doScroll, { once: true });
+    setTimeout(doScroll, 900);
+  } else {
+    doScroll();
+  }
+  return page;
+}
+
+// 把定位框画到对应的页面图上（分单/舱单共用）
+function drawLocateBoxes(boxes) {
+  boxes.forEach((box) => {
+    const inner = root?.querySelector(
+      `.doc-page[data-page="${box.page}"] .doc-page-inner`
+    );
+    const [x, y, width, height] = box.bbox || [];
+    if (!inner || width <= 0 || height <= 0) return;
+    const mark = document.createElement("span");
+    mark.className = "doc-locate-box";
+    mark.style.left = `${x * 100}%`;
+    mark.style.top = `${y * 100}%`;
+    mark.style.width = `${width * 100}%`;
+    mark.style.height = `${height * 100}%`;
+    inner.appendChild(mark);
+  });
+}
+
+// 定位不到（如扫描件）时退化为整页高亮
+function locateEmptyFallback(pageIndex) {
+  const page = pageIndex ? scrollPreviewToBox(pageIndex) : null;
+  page?.classList.add("is-located");
+}
+
+// 点击/聚焦表单字段时，在左侧原图上定位并高亮该字段值
+function highlightFieldLocation(tabId, key) {
+  if (!root || !state.result) return;
+  const input = root.querySelector(
+    `.doc-input[data-key="${key}"][data-tab="${tabId}"]`
+  );
+  // 空输入框没有可定位的内容：只清掉上一次的高亮，不滚动预览区
+  if (!input || !String(input.value || "").trim()) {
+    clearFieldHighlight();
+    return;
+  }
+  const bill = (state.result.house_bills || []).find((item) => item.bill_id === tabId);
+  const boxes = (bill?.field_locations || {})[key] || [];
+  clearFieldHighlight();
+  if (!boxes.length) {
+    locateEmptyFallback((bill?.page_indexes || [])[0]);
+    return;
+  }
+  // 滚到高亮框中心，避免框落在可视区外被裁掉（放大后同样按实时尺寸计算）
+  scrollPreviewToBox(boxes[0].page, boxes[0]);
+  drawLocateBoxes(boxes);
+  // 高亮常显：下次点击其他字段、切换页签或关闭弹窗时才清除
+}
+
+// 舱单行字段：点击时同样在左侧原图上定位高亮
+function highlightManifestField(entryId, key) {
+  if (!root || !state.result) return;
+  const input = root.querySelector(
+    `.doc-input[data-manifest-entry="${entryId}"][data-key="${key}"]`
+  );
+  if (!input || !String(input.value || "").trim()) {
+    clearFieldHighlight();
+    return;
+  }
+  const entry = (state.result.manifest?.entries || []).find(
+    (item) => item.entry_id === entryId
+  );
+  const boxes = (entry?.field_locations || {})[key] || [];
+  clearFieldHighlight();
+  if (!boxes.length) {
+    const pageIndex = (
+      entry?.page_indexes || state.result.manifest?.page_indexes || []
+    )[0];
+    locateEmptyFallback(pageIndex);
+    return;
+  }
+  scrollPreviewToBox(boxes[0].page, boxes[0]);
+  drawLocateBoxes(boxes);
 }
 
 function renderFooter() {
@@ -458,13 +641,117 @@ function renderFooter() {
       : ""
   }</div>
   <div class="doc-foot-right">
-    <button type="button" class="doc-btn" data-action="close">${
-      state.submitted ? "关闭" : "取消"
-    }</button>
     <button type="button" class="doc-submit" data-action="submit" ${
       state.submitted || state.submitting ? "disabled" : ""
     }>${submitLabel}</button>
   </div>`;
+}
+
+// ---------------------------------------------------------------- file tabs
+
+function renderFileTabs() {
+  const tabs = state.fileTabs || [];
+  if (tabs.length <= 1) return "";
+  const activeId = state.result?.task_id || "";
+  const items = tabs
+    .map(
+      (tab) => `<button type="button" role="tab" data-file-tab="${esc(tab.taskId)}"
+        class="doc-file-tab${tab.taskId === activeId ? " is-active" : ""}${
+          tab.submitted ? " is-submitted" : ""
+        }"
+        aria-selected="${tab.taskId === activeId}"
+        title="${esc(tab.name)}${tab.submitted ? "（已提交）" : ""}">
+        ${tab.submitted ? '<span class="doc-file-tab-icon" aria-hidden="true">✓</span>' : ""}
+        <span class="doc-file-tab-name">${esc(tab.name)}</span>
+      </button>`
+    )
+    .join("");
+  return `<div class="doc-file-tabs" role="tablist" aria-label="最近完成的任务">${items}</div>`;
+}
+
+function refreshFileTabs() {
+  const strip = root?.querySelector(".doc-file-tabs");
+  const html = renderFileTabs();
+  if (!strip) {
+    if (html) {
+      const header = root?.querySelector(".doc-dialog-head");
+      header?.insertAdjacentHTML("afterend", html);
+    }
+    return;
+  }
+  if (!html) {
+    strip.remove();
+    return;
+  }
+  strip.outerHTML = html;
+}
+
+async function loadFileTabs(activeTaskId) {
+  try {
+    const tasks = await api.listTasks();
+    const done = (tasks || [])
+      // 只显示有结果、且识别出了分单的任务（0 分单的任务不进页签）
+      .filter(
+        (task) =>
+          task.status === "succeeded" &&
+          task.result_available &&
+          (task.house_bill_count || 0) > 0
+      )
+      .sort((left, right) =>
+        String(right.finished_at || "").localeCompare(String(left.finished_at || ""))
+      );
+    const tabs = done.slice(0, MAX_FILE_TABS).map((task) => ({
+      taskId: task.task_id,
+      name: task.source_name || task.task_id,
+      submitted: Boolean(task.submitted),
+    }));
+    // 当前任务不在最近 5 个里时，占掉最后一格，保证当前项一定能高亮
+    if (activeTaskId && !tabs.some((tab) => tab.taskId === activeTaskId)) {
+      const current = done.find((task) => task.task_id === activeTaskId);
+      if (current) {
+        const item = {
+          taskId: current.task_id,
+          name: current.source_name || current.task_id,
+          submitted: Boolean(current.submitted),
+        };
+        if (tabs.length >= MAX_FILE_TABS) tabs[MAX_FILE_TABS - 1] = item;
+        else tabs.push(item);
+      }
+    }
+    state.fileTabs = tabs;
+  } catch {
+    state.fileTabs = [];
+  }
+}
+
+function markFileTabSubmitted(taskId) {
+  state.fileTabs = (state.fileTabs || []).map((tab) =>
+    tab.taskId === taskId ? { ...tab, submitted: true } : tab
+  );
+  refreshFileTabs();
+}
+
+async function switchTask(taskId) {
+  if (!taskId || taskId === state.result?.task_id || state.submitting) return;
+  try {
+    const snapshot = await api.getTask(taskId);
+    if (snapshot.status !== "succeeded") {
+      showToast("该任务尚未完成，暂不能查看", "error");
+      return;
+    }
+    const result = await api.getResult(taskId);
+    const fileTabs = state.fileTabs;
+    const onSubmitted = state.onSubmitted;
+    await openSubmitDialog({
+      result,
+      snapshot,
+      fields: { house: state.houseFields, manifest: state.manifestFields },
+      onSubmitted,
+      fileTabs,
+    });
+  } catch (error) {
+    showToast(error.message || "切换任务失败", "error");
+  }
 }
 
 function renderDialog() {
@@ -479,10 +766,10 @@ function renderDialog() {
             <span class="doc-dialog-eyebrow">RESULT REVIEW</span>
             <span class="doc-dialog-task">${esc(state.result.task_id)}</span>
           </div>
-          <h1>${esc(state.result.source_name)}</h1>
         </div>
         <button type="button" class="doc-dialog-close" data-action="close" aria-label="关闭">×</button>
       </header>
+      ${renderFileTabs()}
       <div class="doc-dialog-body">
         <section class="doc-dialog-preview">${renderPreview()}</section>
         <section class="doc-dialog-form">
@@ -558,6 +845,8 @@ function refreshFooter() {
 
 function switchTab(tabId) {
   state.activeTab = tabId;
+  // 进入舱单页签即视为人工已查看，红点消失
+  if (tabId === "manifest") state.manifestSeen = true;
   refreshTabs();
   refreshForm();
   refreshFooter();
@@ -586,7 +875,10 @@ function onCalendarOutside(event) {
 }
 
 function onCalendarKeydown(event) {
-  if (event.key === "Escape") closeCalendar();
+  if (event.key !== "Escape") return;
+  closeCalendar();
+  // 阻止继续冒泡：否则弹窗自己的 ESC 处理会顺手把对话框也关掉
+  event.stopPropagation();
 }
 
 function closeCalendar() {
@@ -757,16 +1049,6 @@ async function onSubmit() {
         const fallback = (tab.bill.fields || {})[item.key] ?? "";
         fields[item.key] = valueFor(tab.id, item.key, fallback);
       }
-      // 模板上的制单栏位与核对用的通用栏位同源，空值时互相兜底
-      for (const [general, template] of [
-        ["pieces", "rcp_pieces"],
-        ["weight", "rcp_gross_weight"],
-        ["volume", "rcp_volume"],
-      ]) {
-        if (!String(fields[general] || "").trim() && String(fields[template] || "").trim()) {
-          fields[general] = fields[template];
-        }
-      }
       // 人工填写栏位不在字段目录中，单独收集后随表单提交
       for (const key of HOUSE_MANUAL_KEYS) {
         const fallback = (tab.bill.fields || {})[key] ?? "";
@@ -823,52 +1105,45 @@ async function onSubmit() {
       root.querySelector(".awb-cell.has-error");
     row?.scrollIntoView({ block: "center", behavior: "smooth" });
     row?.querySelector("input")?.focus();
-    showToast("有必填字段为空，请补充后再提交", "error");
+    const missingKey = first.split(":").pop();
+    showToast(
+      `必填未填：${labelForKey(missingKey)}（共 ${errors.size} 项），请补充后再提交`,
+      "error"
+    );
     return;
   }
 
-  state.submitting = true;
+  // 暂时不做真实提交：只做必填校验，通过后仅提示
+  state.submitting = false;
+  state.errors = new Set();
+  refreshForm();
   refreshFooter();
-  try {
-    const response = await api.submitTask(state.result.task_id, {
-      request_id: state.requestId,
-      // 弹窗不再要求二次勾选，提交即视为已核对差异
-      acknowledged: true,
-      documents,
-    });
-    state.submitted = true;
-    state.submissionCode = response.submission_code;
-    state.submittedAt = response.submitted_at;
-    state.submitting = false;
-    state.snapshot = {
-      ...(state.snapshot || {}),
-      submitted: true,
-      submission_code: response.submission_code,
-      submitted_at: response.submitted_at,
-    };
-    renderDialog();
-    requestAnimationFrame(() => highlightActivePages(true));
-    showToast(
-      response.duplicated
-        ? "该单此前已提交成功"
-        : `提交成功，编号 ${response.submission_code}`
-    );
-    if (state.onSubmitted) state.onSubmitted(response);
-  } catch (error) {
-    state.submitting = false;
-    refreshFooter();
-    showToast(error.message, "error");
-  }
+  showToast("必填字段校验通过");
+  void documents;
 }
 
 function bindEvents() {
   if (root.dataset.bound === "1") return;
   root.dataset.bound = "1";
+  // 日期输入框：第一次点击只聚焦并高亮定位，再点一次才打开日历
+  let lastDateClick = { id: "", at: 0 };
   root.addEventListener("click", (event) => {
+    const fileTab = event.target.closest("[data-file-tab]");
+    if (fileTab) {
+      switchTask(fileTab.dataset.fileTab);
+      return;
+    }
     const dateButton = event.target.closest("[data-date-input]");
     if (dateButton) {
-      const input = document.getElementById(dateButton.dataset.dateInput);
-      if (input && !input.disabled) openCalendar(input);
+      const inputId = dateButton.dataset.dateInput;
+      const input = document.getElementById(inputId);
+      if (!input || input.disabled) return;
+      const isIcon = dateButton.classList.contains("awb-date-btn");
+      const now = Date.now();
+      const again = lastDateClick.id === inputId && now - lastDateClick.at < 1500;
+      lastDateClick = { id: inputId, at: now };
+      input.focus();
+      if (isIcon || again) openCalendar(input);
       return;
     }
     const tab = event.target.closest("[data-tab]");
@@ -898,6 +1173,19 @@ function bindEvents() {
   });
 
   root.addEventListener("input", onInput);
+
+  // 聚焦表单字段 → 左侧原图滚动到对应页并高亮字段值（分单/舱单都支持）
+  root.addEventListener("focusin", (event) => {
+    const input = event.target.closest(".doc-input[data-key]");
+    if (!input) return;
+    const tab = activeTab();
+    if (!tab) return;
+    if (tab.type === "house_bill") {
+      highlightFieldLocation(tab.id, input.dataset.key);
+    } else if (tab.type === "manifest" && input.dataset.manifestEntry) {
+      highlightManifestField(input.dataset.manifestEntry, input.dataset.key);
+    }
+  });
 
   // 原单预览支持按住拖动平移（类似图片查看器）
   let drag = null;
@@ -935,16 +1223,24 @@ function bindEvents() {
   });
 }
 
-// 焦点不在弹窗内时也能用 ESC 关闭
+// 焦点不在弹窗内时也能用 ESC 关闭；日历打开时 ESC 只关日历
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && isSubmitDialogOpen() && !state.submitting) {
+  if (event.key !== "Escape" || calendarPop) return;
+  if (isSubmitDialogOpen() && !state.submitting) {
     close();
   }
 });
 
 // ------------------------------------------------------------------ public
 
-export async function openSubmitDialog({ result, snapshot, fields, onSubmitted, focus }) {
+export async function openSubmitDialog({
+  result,
+  snapshot,
+  fields,
+  onSubmitted,
+  focus,
+  fileTabs,
+}) {
   close(true);
   state.result = result;
   state.snapshot = snapshot;
@@ -957,6 +1253,12 @@ export async function openSubmitDialog({ result, snapshot, fields, onSubmitted, 
       ? fields.manifest
       : DEFAULT_MANIFEST_FIELDS;
   state.onSubmitted = onSubmitted || null;
+  // 页签：切换任务时沿用同一批；首次打开按「最近完成」重新加载
+  if (Array.isArray(fileTabs) && fileTabs.length) {
+    state.fileTabs = fileTabs;
+  } else {
+    await loadFileTabs(result.task_id);
+  }
   state.tabs = buildTabs();
   state.edits = {};
   state.manifestEdits = {};
@@ -971,6 +1273,8 @@ export async function openSubmitDialog({ result, snapshot, fields, onSubmitted, 
     (focus && state.tabs.find((tab) => tab.id === focus.tabId)?.id) ||
     state.tabs[0]?.id ||
     "";
+  // 默认就打开舱单时不算「未查看」，红点不出现
+  state.manifestSeen = state.activeTab === "manifest";
 
   // 已提交的任务：用提交时保存的人工修改值回填，保证再次打开看到的是提交版本
   if (state.submitted) {
@@ -992,8 +1296,9 @@ export async function openSubmitDialog({ result, snapshot, fields, onSubmitted, 
 
   if (focus && focus.key) {
     requestAnimationFrame(() => {
+      const focusKey = HOUSE_KEY_ALIASES[focus.key] || focus.key;
       const row =
-        root.querySelector(`[data-row="${focus.tabId}:${focus.key}"]`) ||
+        root.querySelector(`[data-row="${focus.tabId}:${focusKey}"]`) ||
         root.querySelector(".awb-cell.has-error");
       row?.scrollIntoView({ block: "center", behavior: "smooth" });
       row?.classList.add("is-highlight");
@@ -1044,9 +1349,10 @@ export function focusReviewItem(tabId, key) {
     const tab = state.tabs.find((item) => item.id === tabId);
     if (tab) switchTab(tab.id);
   }
+  const houseKey = HOUSE_KEY_ALIASES[key] || key;
   const row = key.startsWith("manifest:")
     ? root.querySelector(`[data-row="${key}"]`)
-    : root.querySelector(`[data-row="${tabId}:${key}"]`);
+    : root.querySelector(`[data-row="${tabId}:${houseKey}"]`);
   const fallbackRow = row || root.querySelector("#docFormPane");
   fallbackRow?.scrollIntoView({ block: "center", behavior: "smooth" });
   fallbackRow?.classList.add("is-highlight");

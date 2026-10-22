@@ -1,31 +1,46 @@
 """待审核清单。"""
 
 from app.schemas.documents import HouseBill, ManifestDocument, ManifestEntry
-from app.schemas.fields import empty_field_map
+from app.schemas.fields import HOUSE_FIELD_KEYS, MANIFEST_FIELD_KEYS, empty_field_map
 from app.service.consistency import compare
 from app.service.review import build_review_items
 
 
-def fields(hawb: str = "HAWB0001", **overrides: str | None) -> dict[str, str | None]:
-    values = empty_field_map()
+def house_fields(hawb: str = "HAWB0001", **overrides: str | None) -> dict[str, str | None]:
+    values = empty_field_map(HOUSE_FIELD_KEYS)
+    values.update(
+        {
+            "hawb": hawb,
+            "sfg": "PVG",
+            "mdg": "LAX",
+            "hbh": "CA1234",
+            "hbrq": "2026-10-20",
+            "zdpiece": "12",
+            "zdweight": "186.5",
+            "zdvolume": "1.20",
+            "companytitle_fhr_hawb": "SHANGHAI EXAMPLE CO., LTD",
+            "address_fhr_hawb": "100 EXAMPLE ROAD, SHANGHAI, CHINA",
+            "phone_fhr_hawb": "+86 21 5888 0000",
+            "email_fhr_hawb": "shipper@example.com",
+            "companytitle_shr_hawb": "EXAMPLE TRADING INC.",
+            "address_shr_hawb": "1000 EXAMPLE BLVD, LOS ANGELES, CA 90001",
+            "phone_shr_hawb": "+1 213 555 0100",
+            "email_shr_hawb": "consignee@example.com",
+        }
+    )
+    values.update(overrides)
+    return values
+
+
+def manifest_fields(hawb: str = "HAWB0001", **overrides: str | None) -> dict[str, str | None]:
+    values = empty_field_map(MANIFEST_FIELD_KEYS)
     values.update(
         {
             "hawb_no": hawb,
-            "origin_port": "PVG",
             "dest_port": "LAX",
-            "flight_no": "CA1234",
-            "flight_date": "2026-10-20",
             "pieces": "12",
             "weight": "186.5",
             "volume": "1.20",
-            "shipper_name": "SHANGHAI EXAMPLE CO., LTD",
-            "shipper_address": "100 EXAMPLE ROAD, SHANGHAI, CHINA",
-            "shipper_phone": "+86 21 5888 0000",
-            "shipper_email": "shipper@example.com",
-            "consignee_name": "EXAMPLE TRADING INC.",
-            "consignee_address": "1000 EXAMPLE BLVD, LOS ANGELES, CA 90001",
-            "consignee_phone": "+1 213 555 0100",
-            "consignee_email": "consignee@example.com",
         }
     )
     values.update(overrides)
@@ -37,7 +52,7 @@ def make_bill(confidence: float = 0.9, **overrides: str | None) -> HouseBill:
         bill_id="bill_001",
         segment_id="seg_002",
         page_indexes=[2],
-        fields=fields(**overrides),
+        fields=house_fields(**overrides),
         confidence=confidence,
     )
 
@@ -49,24 +64,35 @@ def make_manifest(**overrides: str | None) -> ManifestDocument:
             ManifestEntry(
                 entry_id="mft_0001",
                 line_no=1,
-                fields=fields("HAWB0001", **overrides),
+                fields=manifest_fields("HAWB0001", **overrides),
             )
         ],
     )
 
 
-def test_mismatch_and_missing_go_to_review():
-    bill = make_bill(weight="190.0")
-    manifest = make_manifest(weight="220.0", shipper_email=None)
+def test_mismatch_goes_to_review_but_missing_does_not():
+    bill = make_bill(zdweight="190.0")
+    manifest = make_manifest(weight="220.0", pieces=None)
     comparisons, _, _ = compare([bill.model_dump()], manifest)
 
     items = build_review_items([bill], comparisons, manifest)
 
     assert any(item.reason == "mismatch" and item.key == "weight" for item in items)
-    assert any(item.reason == "missing" and item.key == "shipper_email" for item in items)
-    # 字段顺序：重量在发货人邮箱之前
-    keys = [item.key for item in items]
-    assert keys.index("weight") < keys.index("shipper_email")
+    # 空值不再进入待审核
+    assert not any(item.reason == "missing" for item in items)
+    assert not any(item.key == "pieces" for item in items)
+
+
+def test_field_evidence_goes_to_review_with_raw_text():
+    bill = make_bill()
+    bill.field_evidence = {"sfg": "SHANGHAI"}
+
+    items = build_review_items([bill], [], None)
+
+    entry = next(item for item in items if item.key == "sfg")
+    assert entry.reason == "low_confidence"
+    assert entry.evidence == "SHANGHAI"
+    assert entry.tab_id == bill.bill_id
 
 
 def test_low_confidence_creates_bill_level_item():
@@ -81,12 +107,12 @@ def test_low_confidence_creates_bill_level_item():
     assert low[0].key == "_bill"
 
 
-def test_unmatched_manifest_row_goes_to_review():
+def test_unmatched_rows_do_not_go_to_review():
     bill = make_bill(hawb_no="HAWB9999")
     manifest = make_manifest()
     comparisons, _, _ = compare([bill.model_dump()], manifest)
 
     items = build_review_items([bill], comparisons, manifest)
 
-    assert any(item.tab_id == "manifest" and item.reason == "missing" for item in items)
-    assert any("舱单中未找到" in item.message for item in items)
+    # 分单/舱单任一方没有对应行都属于"缺失"，不再进待审核
+    assert items == []

@@ -13,85 +13,89 @@ import time
 
 from app.config import Settings
 
+# 分单按单证接口字段名输出（件数/重量/体积只有制单口径 zd*）
 _MOCK_HOUSE_BILLS = [
     {
-        "hawb_no": "MOCK0001",
-        "origin_port": "PVG",
-        "dest_port": "LAX",
-        "flight_no": "CA1234",
-        "flight_date": "2026-10-20",
-        "pieces": "12",
-        "weight": "186.5",
-        "volume": "1.20",
-        "shipper": {
-            "name": "上海示例贸易有限公司",
-            "address": "上海市浦东新区示例路 100 号",
-            "phone": "021-58880000",
-            "email": "shipper@example.com",
-        },
-        "consignee": {
-            "name": "EXAMPLE TRADING INC.",
-            "address": "1000 Example Blvd, Los Angeles, CA 90001",
-            "phone": "+1 213 555 0100",
-            "email": "consignee@example.com",
-        },
+        "hawb": "MOCK0001",
+        "sfg": "PVG",
+        "mdg": "LAX",
+        "hbh": "CA1234",
+        "hbrq": "2026-10-20",
+        "currency": "CNY",
+        "companytitle_fhr_hawb": "上海示例贸易有限公司",
+        "address_fhr_hawb": "上海市浦东新区示例路 100 号",
+        "city_fhr_hawb": "SHANGHAI",
+        "companycode_fhr_hawb": "CN",
+        "phone_fhr_hawb": "021-58880000",
+        "email_fhr_hawb": "shipper@example.com",
+        "companytitle_shr_hawb": "EXAMPLE TRADING INC.",
+        "address_shr_hawb": "1000 Example Blvd, Los Angeles, CA 90001",
+        "city_shr_hawb": "LOS ANGELES",
+        "companycode_shr_hawb": "US",
+        "state_shr_hawb": "CA",
+        "phone_shr_hawb": "+1 213 555 0100",
+        "email_shr_hawb": "consignee@example.com",
+        "zdpiece": "12",
+        "zdweight": "186.5",
+        "ratelevel": "Q",
+        "jfweight": "186.5",
+        "zdvolume": "1.20",
+        "pm": "MOCK CARGO",
     },
     {
-        "hawb_no": "MOCK0002",
-        "origin_port": "PVG",
-        "dest_port": "LAX",
-        "flight_no": "CA1234",
-        "flight_date": "2026-10-20",
-        "pieces": "8",
-        "weight": "95.0",
-        "volume": "0.80",
-        "shipper": {
-            "name": "苏州示例电子有限公司",
-            "address": "江苏省苏州市工业园区示例大道 8 号",
-            "phone": "0512-66880000",
-            "email": "sales@example-sz.com",
-        },
-        "consignee": {
-            "name": "SAMPLE ELECTRONICS LLC",
-            "address": "2000 Sample Street, Los Angeles, CA 90002",
-            "phone": "+1 213 555 0199",
-            "email": "import@example-la.com",
-        },
+        "hawb": "MOCK0002",
+        "sfg": "PVG",
+        "mdg": "LAX",
+        "hbh": "CA1234",
+        "hbrq": "2026-10-20",
+        "currency": "CNY",
+        "companytitle_fhr_hawb": "苏州示例电子有限公司",
+        "address_fhr_hawb": "江苏省苏州市工业园区示例大道 8 号",
+        "city_fhr_hawb": "SUZHOU",
+        "companycode_fhr_hawb": "CN",
+        "phone_fhr_hawb": "0512-66880000",
+        "email_fhr_hawb": "sales@example-sz.com",
+        "companytitle_shr_hawb": "SAMPLE ELECTRONICS LLC",
+        "address_shr_hawb": "2000 Sample Street, Los Angeles, CA 90002",
+        "city_shr_hawb": "LOS ANGELES",
+        "companycode_shr_hawb": "US",
+        "state_shr_hawb": "CA",
+        "phone_shr_hawb": "+1 213 555 0199",
+        "email_shr_hawb": "import@example-la.com",
+        "zdpiece": "8",
+        "zdweight": "95.0",
+        "ratelevel": "Q",
+        "jfweight": "95.0",
+        "zdvolume": "0.80",
+        "pm": "MOCK CARGO",
     },
 ]
 
+# 舱单按舱单口径（match 键）输出
 _MOCK_MANIFEST = [
     {
-        **_MOCK_HOUSE_BILLS[0],
         "line_no": 1,
+        "hawb_no": "MOCK0001",
+        "dest_port": "LAX",
+        "pieces": "12",
+        "weight": "186.5",
+        "volume": "1.20",
     },
     {
-        **_MOCK_HOUSE_BILLS[1],
-        "weight": "115.0",  # 与分单不一致，用于演示核对差异
         "line_no": 2,
+        "hawb_no": "MOCK0002",
+        "dest_port": "LAX",
+        "pieces": "8",
+        "weight": "115.0",  # 与分单不一致，用于演示核对差异
+        "volume": "0.80",
     },
     {
+        "line_no": 3,
         "hawb_no": "MOCK0003",
-        "origin_port": "PVG",
         "dest_port": "ORD",
-        "flight_no": "CA1235",
-        "flight_date": "2026-10-21",
         "pieces": "5",
         "weight": "60.0",
         "volume": "0.45",
-        "shipper": {
-            "name": "宁波示例服饰有限公司",
-            "address": "宁波市鄞州区示例路 9 号",
-            "phone": "0574-88000000",
-            "email": "nb@example.com",
-        },
-        "consignee": {
-            "name": "CHICAGO SAMPLE CO.",
-            "address": "3000 Sample Ave, Chicago, IL 60601",
-            "phone": "+1 312 555 0123",
-            "email": "chi@example.com",
-        },
-        "line_no": 3,
     },
 ]
 
@@ -106,10 +110,7 @@ class MockModelGateway:
         if "分类" in label or "分类" in system_prompt:
             return self._classify(human_prompt)
         if "舱单" in label:
-            return json.dumps(
-                [{"line_no": row.pop("line_no"), **row} for row in _clone(_MOCK_MANIFEST)],
-                ensure_ascii=False,
-            )
+            return json.dumps(_clone(_MOCK_MANIFEST), ensure_ascii=False)
         if "分单" in label:
             index = self._house_index % len(_MOCK_HOUSE_BILLS)
             self._house_index += 1

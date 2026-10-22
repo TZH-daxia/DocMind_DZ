@@ -26,6 +26,7 @@ def settings(tmp_path: Path) -> Settings:
         mock_llm=True,
         house_bill_concurrency=1,
         text_layer_min_chars=20,
+        office_render_enabled=False,
         model_api_key="test-key",
     )
 

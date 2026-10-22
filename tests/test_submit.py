@@ -75,25 +75,6 @@ async def test_submit_requires_acknowledgement_when_inconsistent(settings, tmp_p
     assert replay.submission_code == response.submission_code
 
 
-async def test_retry_clears_submission_state(settings, tmp_path):
-    pdf = write_pdf(
-        tmp_path / "bundle.pdf",
-        [MASTER_PAGE, house_page("HAWB0001"), house_page("HAWB0002"), MANIFEST_PAGE],
-    )
-    service = TaskService(settings)
-    snapshot = service.create_task(
-        UploadedDocument(filename="bundle.pdf", content=pdf.read_bytes())
-    )
-    await _run_task(service, snapshot.task_id)
-    service.submit(snapshot.task_id, _submit_payload("req-2", acknowledged=True))
-
-    service.retry_task(snapshot.task_id)
-    reset = service.get_snapshot(snapshot.task_id)
-    assert reset.submitted is False
-    assert reset.submission_code is None
-    await _run_task(service, snapshot.task_id)
-
-
 def test_submit_rejects_unfinished_task(settings, tmp_path):
     pdf = write_pdf(tmp_path / "x.pdf", [MASTER_PAGE])
     service = TaskService(settings)

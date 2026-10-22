@@ -13,7 +13,8 @@ export const STATUS_CLASS = {
   paused: "review",
   succeeded: "ready",
   failed: "failed",
-  cancelled: "idle",
+  // 已取消是用户主动操作，用中性灰与「失败」区分（与 DocMind 一致）
+  cancelled: "cancelled",
 };
 
 export const BILL_STATUS = {
@@ -67,60 +68,86 @@ export const PARTY_GROUP_LABEL = {
   consignee: "CONSIGNEE'S NAME AND ADDRESS",
 };
 
-// 分单字段（与后端 HOUSE_FIELD_SPECS 一致，38 项）
+// 分单字段（与后端 HOUSE_FIELD_SPECS 一致，36 项；key 为接口字段名）
 export const DEFAULT_HOUSE_FIELDS = [
-  ["hawb_no", "分单号", "shipment"],
-  ["origin_port", "始发港", "shipment"],
-  ["dest_port", "目的港", "shipment"],
-  ["flight_no", "航班号", "shipment"],
-  ["flight_date", "航班日期", "shipment"],
-  ["pieces", "件数", "shipment"],
-  ["weight", "重量", "shipment"],
-  ["volume", "体积", "shipment"],
-  ["first_carrier_code", "航班二字码（By First Carrier）", "shipment"],
+  ["hawb", "分单号", "shipment"],
+  ["sfg", "始发港", "shipment"],
+  ["mdg", "目的港", "shipment"],
+  ["hbh", "航班号", "shipment"],
+  ["hbrq", "航班日期", "shipment"],
   ["currency", "币种（Currency）", "shipment"],
-  ["shipper_name", "发货人名称", "shipper"],
-  ["shipper_address", "发货人地址", "shipper"],
-  ["shipper_city", "发货人城市", "shipper"],
-  ["shipper_postal_code", "发货人邮编", "shipper"],
-  ["shipper_state", "发货人州名", "shipper"],
-  ["shipper_contact", "发货人联系人", "shipper"],
-  ["shipper_phone", "发货人手机号", "shipper"],
-  ["shipper_email", "发货人邮箱", "shipper"],
-  ["shipper_fax", "发货人传真", "shipper"],
-  ["consignee_name", "收货人名称", "consignee"],
-  ["consignee_address", "收货人地址", "consignee"],
-  ["consignee_city", "收货人城市", "consignee"],
-  ["consignee_postal_code", "收货人邮编", "consignee"],
-  ["consignee_state", "收货人州名", "consignee"],
-  ["consignee_contact", "收货人联系人", "consignee"],
-  ["consignee_phone", "收货人手机号", "consignee"],
-  ["consignee_email", "收货人邮箱", "consignee"],
-  ["consignee_fax", "收货人传真", "consignee"],
-  ["declared_value_carriage", "声明价值（Declared Value for Carriage）", "declaration"],
-  ["handling_info", "操作信息（Handling Information）", "declaration"],
-  ["rcp_pieces", "制单件数（No. of Pieces RCP）", "cargo"],
-  ["rcp_gross_weight", "制单重量（Gross Weight）", "cargo"],
-  ["rate_class", "运价类别（Rate Class）", "cargo"],
-  ["chargeable_weight", "计费重量（Chargeable Weight）", "cargo"],
-  ["rate_charge", "单价（Rate/Charge）", "cargo"],
-  ["rate_total", "总价（Rate/Total）", "cargo"],
-  ["rcp_volume", "制单体积（Volume）", "cargo"],
-  ["goods_description", "品名（Nature and Quantity of Goods）", "cargo"],
+  ["companytitle_fhr_hawb", "发货人名称", "shipper"],
+  ["address_fhr_hawb", "发货人地址", "shipper"],
+  ["city_fhr_hawb", "发货人城市", "shipper"],
+  ["postcode_fhr_hawb", "发货人邮编", "shipper"],
+  ["companycode_fhr_hawb", "发货人国家二字码", "shipper"],
+  ["state_fhr_hawb", "发货人州名", "shipper"],
+  ["lxr_fhr_hawb", "发货人联系人", "shipper"],
+  ["phone_fhr_hawb", "发货人手机号", "shipper"],
+  ["email_fhr_hawb", "发货人邮箱", "shipper"],
+  ["fax_fhr_hawb", "发货人传真", "shipper"],
+  ["companytitle_shr_hawb", "收货人名称", "consignee"],
+  ["address_shr_hawb", "收货人地址", "consignee"],
+  ["city_shr_hawb", "收货人城市", "consignee"],
+  ["postcode_shr_hawb", "收货人邮编", "consignee"],
+  ["companycode_shr_hawb", "收货人国家二字码", "consignee"],
+  ["state_shr_hawb", "收货人州名", "consignee"],
+  ["lxr_shr_hawb", "收货人联系人", "consignee"],
+  ["phone_shr_hawb", "收货人手机号", "consignee"],
+  ["email_shr_hawb", "收货人邮箱", "consignee"],
+  ["fax_shr_hawb", "收货人传真", "consignee"],
+  ["declarecustom", "申报价值（Declared Value for Customs）", "declaration"],
+  ["handlinginfo", "操作信息（Handling Information）", "declaration"],
+  ["zdpiece", "制单件数（No. of Pieces RCP）", "cargo"],
+  ["zdweight", "制单重量（Gross Weight）", "cargo"],
+  ["ratelevel", "运价类别（Rate Class）", "cargo"],
+  ["jfweight", "计费重量（Chargeable Weight）", "cargo"],
+  ["rate", "单价（Rate/Charge）", "cargo"],
+  ["ratetotal", "总价（Rate/Total）", "cargo"],
+  ["zdvolume", "制单体积（Volume）", "cargo"],
+  ["pm", "品名（Nature and Quantity of Goods）", "cargo"],
 ].map(([key, label, group]) => ({ key, label, group }));
 
-// 舱单与分单共用同一套字段，便于逐字段核对
-export const DEFAULT_MANIFEST_FIELDS = DEFAULT_HOUSE_FIELDS;
-export const DEFAULT_FIELDS = DEFAULT_HOUSE_FIELDS;
+// 舱单只抽取核对字段：分单号 + 目的港 + 制单件数/重量/计费重/体积
+export const DEFAULT_MANIFEST_FIELDS = [
+  ["hawb_no", "分单号", "shipment"],
+  ["dest_port", "目的港", "shipment"],
+  ["pieces", "件数", "shipment"],
+  ["weight", "重量", "shipment"],
+  ["chargeable_weight", "计费重量", "cargo"],
+  ["volume", "体积", "shipment"],
+].map(([key, label, group]) => ({ key, label, group }));
+export const DEFAULT_FIELDS = DEFAULT_MANIFEST_FIELDS;
+
+// 参与人字段 → 接口字段名：shipper → *_fhr_hawb，consignee → *_shr_hawb
+const PARTY_FIELD_PREFIX = {
+  name: "companytitle",
+  address: "address",
+  city: "city",
+  postal_code: "postcode",
+  country: "companycode",
+  state: "state",
+  contact: "lxr",
+  phone: "phone",
+  email: "email",
+  fax: "fax",
+};
+const PARTY_CODE = { shipper: "fhr", consignee: "shr" };
+
+export function partyFieldKey(party, name) {
+  return `${PARTY_FIELD_PREFIX[name] || name}_${PARTY_CODE[party] || party}_hawb`;
+}
 
 // 分单固定单证模板：严格按参考 AWB 版面从上到下、从左到右排列，
 // 只保留需要抽取的字段；col/span 为 12 栅格中的列位置。
+// 12 栅格：第一行 5 个（城市/邮编/国家/州/联系人 = 3+2+2+2+3），第二行 3 个（电话/邮箱/传真各 4）
 const PARTY_TEMPLATE_FIELDS = [
   { key: "name", span: 12, label: "Name" },
   { key: "address", span: 12, textarea: true, label: "Address" },
   { key: "city", span: 3, label: "City" },
-  { key: "postal_code", span: 3, label: "Postal Code" },
-  { key: "state", span: 3, label: "State" },
+  { key: "postal_code", span: 2, label: "Postal Code" },
+  { key: "country", span: 2, label: "Country" },
+  { key: "state", span: 2, label: "State" },
   { key: "contact", span: 3, label: "Contact" },
   { key: "phone", span: 4, label: "Mobile" },
   { key: "email", span: 4, label: "Email" },
@@ -129,22 +156,21 @@ const PARTY_TEMPLATE_FIELDS = [
 
 export const HOUSE_TEMPLATE = [
   // 右上：HAWB No.；左侧空白放单据摘要信息
-  { id: "hawb", info: true, fields: [{ key: "hawb_no", col: 9, span: 4, label: "HAWB No." }] },
+  { id: "hawb", info: true, fields: [{ key: "hawb", col: 9, span: 4, label: "HAWB No." }] },
   // 当事人整行：名称 / 地址（多行）/ 城市 + 国家 + 电话 + 邮箱
   { id: "shipper", party: "shipper", col: 1, span: 12, fields: PARTY_TEMPLATE_FIELDS },
   { id: "consignee", party: "consignee", col: 1, span: 12, fields: PARTY_TEMPLATE_FIELDS },
-  // 运输与申报：Airport of Departure 右侧依次是 By First Carrier / Currency / Declared Value
+  // 运输与申报：Airport of Departure 右侧依次是 Currency / Declared Value（不再抽 By First Carrier）
   {
     id: "routing",
     fields: [
-      { key: "origin_port", col: 1, span: 3, label: "Airport of Departure" },
-      { key: "first_carrier_code", col: 4, span: 2, label: "By First Carrier" },
-      { key: "currency", col: 6, span: 2, label: "Currency" },
+      { key: "sfg", col: 1, span: 4, label: "Airport of Departure" },
+      { key: "currency", col: 5, span: 3, label: "Currency" },
       {
-        key: "declared_value_carriage",
+        key: "declarecustom",
         col: 8,
         span: 5,
-        label: "Declared Value for Carriage",
+        label: "Declared Value for Customs",
       },
     ],
   },
@@ -152,96 +178,63 @@ export const HOUSE_TEMPLATE = [
   {
     id: "flight",
     fields: [
-      { key: "dest_port", col: 1, span: 4, label: "Airport of Destination" },
-      { key: "flight_no", col: 5, span: 4, label: "Flight No." },
-      { key: "flight_date", col: 9, span: 4, date: true, label: "Flight Date" },
+      { key: "mdg", col: 1, span: 4, label: "Airport of Destination" },
+      { key: "hbh", col: 5, span: 4, label: "Flight No." },
+      { key: "hbrq", col: 9, span: 4, date: true, label: "Flight Date" },
     ],
   },
   // Handling Information：整行多行输入
   {
     id: "handling",
     fields: [
-      { key: "handling_info", col: 1, span: 12, label: "Handling Information", textarea: true },
+      { key: "handlinginfo", col: 1, span: 12, label: "Handling Information", textarea: true },
     ],
   },
-  // 货物表：No. of Pieces RCP → Gross Weight → Rate Class → Chargeable Weight → Volume → Nature and Quantity
-  // 该行用 24 栅格细分列宽，件数不至于过窄
+  // 货物表两排、每排 4 个：第一排 件数 / 毛重 / 运价 / 计费重
   {
     id: "cargo",
-    cols: 24,
     fields: [
-      { key: "rcp_pieces", col: 1, span: 2, label: "No. of Pieces RCP" },
-      { key: "rcp_gross_weight", col: 3, span: 3, label: "Gross Weight" },
-      { key: "rate_class", col: 6, span: 3, label: "Rate Class" },
-      { key: "chargeable_weight", col: 9, span: 3, label: "Chargeable Weight" },
-      { key: "rate_charge", col: 12, span: 3, label: "Rate/Charge" },
-      { key: "rate_total", col: 15, span: 3, label: "Rate/Total" },
-      { key: "rcp_volume", col: 18, span: 2, label: "Volume" },
-      { key: "goods_description", col: 20, span: 5, label: "Nature and Quantity of Goods" },
+      { key: "zdpiece", col: 1, span: 3, label: "No. of Pieces RCP" },
+      { key: "zdweight", col: 4, span: 3, label: "Gross Weight" },
+      { key: "ratelevel", col: 7, span: 3, label: "Rate Class" },
+      { key: "jfweight", col: 10, span: 3, label: "Chargeable Weight" },
+    ],
+  },
+  // 第二排 单价 / 总价 / 体积 / 品名（品名占半行，保证长名称能完整显示）
+  {
+    id: "cargo2",
+    fields: [
+      { key: "rate", col: 1, span: 2, label: "Rate/Charge" },
+      { key: "ratetotal", col: 3, span: 2, label: "Rate/Total" },
+      { key: "zdvolume", col: 5, span: 2, label: "Volume" },
+      {
+        key: "pm",
+        col: 7,
+        span: 6,
+        label: "Nature and Quantity of Goods",
+      },
     ],
   },
 ];
 
-export const MANIFEST_GROUPS = [
-  "shipment",
-  "shipper",
-  "consignee",
-  "declaration",
-  "cargo",
-];
+export const MANIFEST_GROUPS = ["shipment", "cargo"];
 
 // 舱单页签字段名沿用舱单表格里的英文表头
 export const MANIFEST_LABELS_EN = {
   hawb_no: "HAWB No.",
-  origin_port: "Origin",
   dest_port: "Destination",
-  flight_no: "Flight No.",
-  flight_date: "Flight Date",
   pieces: "Pieces",
   weight: "Weight",
-  volume: "Volume",
-  first_carrier_code: "Carrier",
-  currency: "Currency",
-  shipper_name: "Shipper Name",
-  shipper_address: "Shipper Address",
-  shipper_city: "Shipper City",
-  shipper_postal_code: "Shipper Postal",
-  shipper_state: "Shipper State",
-  shipper_contact: "Shipper Contact",
-  shipper_phone: "Shipper Tel",
-  shipper_email: "Shipper Email",
-  shipper_fax: "Shipper Fax",
-  consignee_name: "Consignee Name",
-  consignee_address: "Consignee Address",
-  consignee_city: "Consignee City",
-  consignee_postal_code: "Consignee Postal",
-  consignee_state: "Consignee State",
-  consignee_contact: "Consignee Contact",
-  consignee_phone: "Consignee Tel",
-  consignee_email: "Consignee Email",
-  consignee_fax: "Consignee Fax",
-  declared_value_carriage: "Declared Value",
-  handling_info: "Handling Info",
-  rcp_pieces: "Pieces RCP",
-  rcp_gross_weight: "Gross Weight",
-  rate_class: "Rate Class",
   chargeable_weight: "Chargeable Weight",
-  rate_charge: "Rate/Charge",
-  rate_total: "Total",
-  rcp_volume: "Volume",
-  goods_description: "Goods Description",
+  volume: "Volume",
 };
 
 // 单证上需要人工填写、不参与识别的栏位（当前全部改为自动抽取）
 export const HOUSE_MANUAL_KEYS = [];
 
-// 分单表单必填项（提交前校验，只校验模板中可见的栏位）
-export const REQUIRED_KEYS = [
-  "hawb_no",
-  "origin_port",
-  "dest_port",
-  "flight_no",
-  "flight_date",
-];
+// 分单表单必填项：除发货人/收货人信息外的所有字段都必须有值
+export const REQUIRED_KEYS = DEFAULT_HOUSE_FIELDS.filter(
+  (field) => field.group !== "shipper" && field.group !== "consignee"
+).map((field) => field.key);
 
 export const MANIFEST_REQUIRED_KEYS = ["hawb_no", "pieces", "weight"];

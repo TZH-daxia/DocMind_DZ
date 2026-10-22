@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>DocMind DZ · 主单 / 分单 / 舱单核对台</title>
+    <title>AI-单证识别</title>
     <link rel="stylesheet" href="styles.css?v=20261020" />
   </head>
   <body>
@@ -12,8 +12,8 @@
         <div class="brand">
           <span class="brand-mark">DZ</span>
           <div>
-            <div class="brand-name">DocMind DZ</div>
-            <div class="brand-subtitle">主单 · 分单 · 舱单核对台</div>
+            <div class="brand-name">DocMind_DZ</div>
+            <div class="brand-subtitle">AI-单证识别</div>
           </div>
         </div>
         <div class="topbar-meta">
@@ -36,13 +36,13 @@
           <label class="upload-dropzone" id="uploadDropzone">
             <span class="dropzone-icon">＋</span>
             <strong>添加单证文件</strong>
-            <small>PDF / Word / Excel / 图片<br />可一次选择分单 + 舱单</small>
+            <small>PDF / Word / Excel<br />单次最多 5 个文件，每个文件一个任务</small>
             <input
               type="file"
               id="fileInput"
               hidden
               multiple
-              accept=".pdf,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp"
+              accept=".pdf,.doc,.docx,.xls,.xlsx"
             />
           </label>
 

@@ -55,27 +55,27 @@ class Settings(BaseSettings):
     log_dir: Path = Path("logs")
     log_level: str = "INFO"
     log_console: bool = False
+    # 系统日志按天轮转，保留天数（同时限制历史日志占用的磁盘）
+    log_retention_days: int = 14
 
     # 单文件上传限制
     max_file_size_mb: int = 50
+    # 一次上传的文件数上限（前端一个文件一个任务，合并上传时同样受限）
+    max_upload_files: int = 5
     max_pages: int = 30
+    # 暂不支持图片文件（png/jpg 等）
     allowed_extensions: tuple[str, ...] = (
         ".pdf",
         ".doc",
         ".docx",
         ".xls",
         ".xlsx",
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".bmp",
-        ".tif",
-        ".tiff",
-        ".webp",
     )
 
     # 渲染
     render_dpi: int = 200
+    # Word/Excel 是否用 LibreOffice 转 PDF 后渲染页图（关闭则只抽文本，无页面图片）
+    office_render_enabled: bool = True
     # 文本层字符数低于该值视为“扫描件”，需要 VLM 转写
     text_layer_min_chars: int = 180
     force_vlm: bool = False
@@ -97,9 +97,19 @@ class Settings(BaseSettings):
     model_vision_timeout_seconds: float = 120.0
     model_connect_timeout_seconds: float = 10.0
     model_call_retries: int = 1
-    model_max_concurrency: int = Field(default=4, ge=1)
+    # 模型调用总并发（文本 + 视觉共用），超限排队；排队时间不计入调用超时
+    model_max_concurrency: int = Field(default=16, ge=1)
+    # 同一任务内多份分单的并行抽取数
     house_bill_concurrency: int = Field(default=3, ge=1)
-    max_concurrent_tasks: int = Field(default=4, ge=1)
+    # 视觉转写逐页并发（实际还受 model_max_concurrency 限制）
+    vision_page_concurrency: int = Field(default=2, ge=1)
+    # LibreOffice 转 PDF 并发：soffice 单实例，默认串行
+    office_concurrency: int = Field(default=1, ge=1)
+    # 同时执行的任务数，超限排队（快照保持 queued）
+    max_concurrent_tasks: int = Field(default=5, ge=1)
+    # provider 熔断：连续失败 N 次进入冷却，冷却期内直接走兜底
+    model_circuit_failures: int = Field(default=3, ge=1)
+    model_circuit_cooldown_seconds: float = 90.0
 
     # 本地演示模式：不调用真实模型
     mock_llm: bool = False
@@ -110,6 +120,8 @@ class Settings(BaseSettings):
     # 数据保留
     data_retention_hours: float = 168.0
 
+    # 开发调试用：true 时允许任意来源（生产环境不要打开）
+    cors_allow_all: bool = False
     # 额外放行的前端来源（逗号分隔，通常留空）：本地 localhost / 127.0.0.1 / 本机 IP
     # 已由 cors_origin_regex 自动放行，只有独立域名部署时才需要在这里追加
     cors_allow_origins: str = ""
@@ -118,8 +130,10 @@ class Settings(BaseSettings):
 
     @property
     def cors_origin_list(self) -> list[str]:
-        """显式来源列表；过滤空项并去重。"""
+        """显式来源列表；过滤空项并去重。开发开关打开时返回通配。"""
 
+        if self.cors_allow_all:
+            return ["*"]
         origins: list[str] = []
         for item in self.cors_allow_origins.split(","):
             origin = item.strip()

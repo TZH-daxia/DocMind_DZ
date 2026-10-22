@@ -51,13 +51,6 @@ export const api = {
   cancelTask: (taskId) =>
     request(`/tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST" }),
 
-  submitTask: (taskId, payload) =>
-    request(`/tasks/${encodeURIComponent(taskId)}/submit`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }),
-
   getSubmission: (taskId) =>
     request(`/tasks/${encodeURIComponent(taskId)}/submission`),
 

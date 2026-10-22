@@ -121,7 +121,7 @@ def main() -> int:
             print(
                 "house bills:",
                 [
-                    {"no": bill["fields"].get("hawb_no"), "pages": bill["page_indexes"]}
+                    {"no": bill["fields"].get("hawb"), "pages": bill["page_indexes"]}
                     for bill in result["house_bills"]
                 ],
             )

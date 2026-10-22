@@ -36,6 +36,9 @@ const dom = {
   cancelButton: document.getElementById("cancelButton"),
 };
 
+// 单次批量上传的文件数上限（一个文件一个任务）
+const MAX_UPLOAD_FILES = 5;
+
 const state = {
   tasks: [],
   selectedId: null,
@@ -93,22 +96,40 @@ function renderTaskList() {
   dom.taskList.innerHTML = state.tasks
     .map((task) => {
       const active = task.task_id === state.selectedId ? " selected" : "";
-      const dot = STATUS_CLASS[task.status] || "idle";
+      let dot = STATUS_CLASS[task.status] || "idle";
       const submitted = task.submitted
         ? '<em class="file-flag submitted">已提交</em>'
         : "";
-      let detail = STATUS_LABEL[task.status] || task.status;
+      // 已取消/已暂停用小标签表达，副标题留空避免同一状态写两遍（与 DocMind 一致）
+      const stateFlag =
+        task.status === "cancelled"
+          ? '<em class="file-flag">已取消</em>'
+          : task.status === "paused"
+            ? '<em class="file-flag">已暂停</em>'
+            : "";
+      let detail =
+        task.status === "cancelled" || task.status === "paused"
+          ? ""
+          : STATUS_LABEL[task.status] || task.status;
       if (task.status === "succeeded") {
-        detail = `${task.house_bill_count} 分单 · ${
-          task.inconsistent_count > 0 ? `${task.inconsistent_count} 差异` : "无字段冲突"
-        }`;
+        const houseCount = task.house_bill_count || 0;
+        detail =
+          houseCount === 0
+            ? "0 分单"
+            : `${houseCount} 分单 · ${
+                task.inconsistent_count > 0
+                  ? `${task.inconsistent_count} 差异`
+                  : "无字段冲突"
+              }`;
+        // 0 分单（只有主单/舱单被跳过）：黄色，既不是正常结果也不是失败
+        if (houseCount === 0) dot = "warn";
       }
       return `<button class="file-item${active}" data-task-id="${esc(task.task_id)}">
         <span class="file-type">${fileTypeTag(task.source_name)}</span>
         <span class="file-copy">
           <strong title="${esc(task.source_name)}">${esc(task.source_name)}</strong>
           <small>${esc(detail)}</small>
-          ${submitted}
+          ${stateFlag}${submitted}
         </span>
         <span class="status-dot ${dot}"></span>
       </button>`;
@@ -164,7 +185,10 @@ async function loadTaskDetail(taskId) {
     await loadResult(taskId);
   } else if (snapshot.status === "failed") {
     renderFailure();
-  } else {
+  } else if (snapshot.status === "cancelled") {
+    renderCancelled();
+  } else if (!isTerminal(snapshot.status)) {
+    // 只有还在跑（或暂停）的任务才订阅实时事件；取消/失败/成功再订阅会重放历史
     subscribeTask(taskId);
   }
 }
@@ -239,7 +263,10 @@ function nodeRows() {
     // 节点耗时由节点完成事件（phase=succeeded/failed）带出
     const finished = [...events].reverse().find((event) => event.duration_ms != null);
     let status = "idle";
-    if (last) {
+    if (last?.phase === "skipped") {
+      // 图里被条件边跳过的节点（如只有主单时的抽取/核对）
+      status = "skipped";
+    } else if (last) {
       const nextStarted = NODES.slice(index + 1).some((name) => byStep.has(name));
       if (last.level === "error" || (failed && failedStep === label)) {
         status = "failed";
@@ -321,7 +348,7 @@ function compactPayload(result) {
     })),
     house_bills: (result.house_bills || []).map((bill) => ({
       bill_id: bill.bill_id,
-      hawb_no: bill.fields?.hawb_no,
+      hawb_no: bill.fields?.hawb,
       page_indexes: bill.page_indexes,
       confidence: bill.confidence,
       fields: bill.fields,
@@ -329,6 +356,7 @@ function compactPayload(result) {
     manifest: result.manifest
       ? {
           page_indexes: result.manifest.page_indexes,
+          master: result.manifest.master,
           entries: (result.manifest.entries || []).map((entry) => ({
             line_no: entry.line_no,
             fields: entry.fields,
@@ -336,6 +364,7 @@ function compactPayload(result) {
         }
       : null,
     summary: result.summary,
+    totals_checks: result.totals_checks,
     review_items: result.review_items,
   };
 }
@@ -366,6 +395,13 @@ function renderResult() {
     }">待审核 <b>${
       (result.review_items || []).filter((item) => item.reason !== "mismatch").length
     }</b></span>`,
+    `<span class="summary-pill ${
+      (result.totals_checks || []).some((item) => item.status === "mismatch")
+        ? "failed"
+        : ""
+    }">汇总差异 <b>${
+      (result.totals_checks || []).filter((item) => item.status === "mismatch").length
+    }</b></span>`,
   ];
   if (snapshot.submitted) {
     pills.push(
@@ -382,7 +418,8 @@ function renderResult() {
   )}</code>`;
 
   dom.copyButton.disabled = false;
-  dom.prepareButton.disabled = false;
+  // 没有分单就没有可提交的内容：按钮只置灰，文案保持原样
+  dom.prepareButton.disabled = (result.house_bills || []).length === 0;
   dom.prepareButton.textContent = snapshot.submitted ? "已提交 · 查看" : "开始提交";
 }
 
@@ -390,7 +427,17 @@ function renderReviewList(result) {
   const items = result.review_items || [];
   const diffs = items.filter((item) => item.reason === "mismatch");
   const pending = items.filter((item) => item.reason !== "mismatch");
-  dom.reviewArea.innerHTML = `
+  const warnings = result.warnings || [];
+  const hasHouse = (result.house_bills || []).length > 0;
+  // 只有主单/只有舱单：没有可提取的分单，直接把原因提示在列表上方
+  const notice =
+    !hasHouse && warnings.length
+      ? `<div class="result-notice">
+          <strong>没有可提取的分单</strong>
+          <span>${esc(warnings.join("；"))}</span>
+        </div>`
+      : "";
+  dom.reviewArea.innerHTML = `${notice}
     ${renderReviewBlock("差异", diffs, "failed")}
     ${renderReviewBlock("待审核", pending, "review")}
   `;
@@ -406,7 +453,7 @@ function renderReviewBlock(title, items, kind) {
   const rows = items
     .map((item) => {
       const tab = state.result.house_bills.find((bill) => bill.bill_id === item.tab_id);
-      const hawb = tab?.fields?.hawb_no || (item.tab_id === "manifest" ? "舱单" : item.tab_id);
+      const hawb = tab?.fields?.hawb || (item.tab_id === "manifest" ? "舱单" : item.tab_id);
       return `<button class="review-item ${kind}" data-tab="${esc(
         item.tab_id
       )}" data-key="${esc(item.key)}">
@@ -422,6 +469,16 @@ function renderReviewBlock(title, items, kind) {
     <div class="review-head"><span>${title}</span><b>${items.length}</b></div>
     <div class="review-list">${rows}</div>
   </div>`;
+}
+
+function renderCancelled() {
+  // 取消没有核对结果：结果区清空，状态交给进度区与列表标签表达（同 DocMind）
+  dom.resultSummary.innerHTML = "";
+  dom.reviewArea.innerHTML = "";
+  dom.resultJson.innerHTML = "<code>{}</code>";
+  dom.copyButton.disabled = true;
+  dom.prepareButton.disabled = true;
+  dom.prepareButton.textContent = "开始提交";
 }
 
 function renderFailure() {
@@ -455,7 +512,12 @@ function openDialog(focus) {
     snapshot: state.snapshot,
     fields: state.fields,
     focus,
-    onSubmitted(response) {
+    onSubmitted(response, taskId) {
+      // 在弹窗里切换任务后提交：只刷新列表，不覆盖当前选中任务的状态
+      if (taskId && taskId !== state.selectedId) {
+        refreshTasks();
+        return;
+      }
       state.snapshot = {
         ...state.snapshot,
         submitted: true,
@@ -474,23 +536,56 @@ function openDialog(focus) {
 async function uploadFiles(input) {
   const files = (input ? Array.from(input) : []).filter(Boolean);
   if (files.length === 0) return;
-  const maxBytes = 50 * 1024 * 1024;
-  const tooLarge = files.find((file) => file.size > maxBytes);
-  if (tooLarge) {
-    showToast(`${tooLarge.name} 超过 50MB 限制`, "error");
+  // 超过上限整批拒绝：提示后清空选择，等用户重新选，不做部分上传
+  if (files.length > MAX_UPLOAD_FILES) {
+    showToast(
+      `单次最多上传 ${MAX_UPLOAD_FILES} 个文件，当前选中 ${files.length} 个，请重新选择`,
+      "warning"
+    );
+    dom.fileInput.value = "";
     return;
   }
-  showToast(files.length > 1 ? `正在上传 ${files.length} 个文件…` : `正在上传 ${files[0].name}…`);
+  const batch = files;
+  const maxBytes = 50 * 1024 * 1024;
+  const tooLarge = batch.find((file) => file.size > maxBytes);
+  if (tooLarge) {
+    showToast(`${tooLarge.name} 超过 50MB 限制`, "error");
+    dom.fileInput.value = "";
+    return;
+  }
+  showToast(batch.length > 1 ? `正在上传 ${batch.length} 个文件…` : `正在上传 ${batch[0].name}…`);
+
+  // 一个文件一个任务：逐个创建（串行，避免瞬时打满后端并发）
+  const created = [];
+  const failed = [];
   try {
-    const snapshot = await api.createTask(files);
-    showToast("任务已创建，开始识别");
-    await refreshTasks();
-    selectTask(snapshot.task_id);
-  } catch (error) {
-    showToast(error.message, "error");
+    for (const file of batch) {
+      try {
+        const snapshot = await api.createTask([file]);
+        created.push(snapshot.task_id);
+      } catch (error) {
+        failed.push(`${file.name}：${error.message}`);
+      }
+    }
+    if (created.length) {
+      showToast(
+        `已创建 ${created.length} 个任务${failed.length ? `，${failed.length} 个失败` : ""}`
+      );
+      await refreshTasks();
+      selectTask(created[created.length - 1]);
+    } else {
+      showToast(failed[0] || "上传失败", "error");
+    }
+    if (failed.length > 1) {
+      showToast(failed.join("；"), "error");
+    }
   } finally {
     dom.fileInput.value = "";
   }
+}
+
+function isTerminal(status) {
+  return status === "succeeded" || status === "failed" || status === "cancelled";
 }
 
 function subscribeTask(taskId) {
@@ -498,6 +593,8 @@ function subscribeTask(taskId) {
   state.unsubscribe = api.subscribe(taskId, {
     onEvent(event) {
       if (taskId !== state.selectedId) return;
+      // 重连会从头重放历史事件，按 seq 去重，避免进度文案与时间线反复跳变
+      if (state.events.some((item) => item.seq === event.seq)) return;
       state.events.push(event);
       const latest = state.events[state.events.length - 1];
       if (latest) {
@@ -511,7 +608,13 @@ function subscribeTask(taskId) {
       if (taskId !== state.selectedId) return;
       if (snapshot) state.snapshot = snapshot;
       renderSelectedFile();
-      loadTaskDetail(taskId);
+      renderEvents();
+      // 终态不再重新订阅（否则会重放历史、反复刷新进度文案）
+      if (snapshot?.status === "succeeded") {
+        loadResult(taskId);
+      } else if (snapshot?.status === "failed") {
+        renderFailure();
+      }
       refreshTasks();
     },
     onError() {
@@ -550,6 +653,7 @@ function startPolling(taskId) {
         refreshTasks();
       } else if (snapshot.status === "cancelled") {
         stopPolling();
+        renderCancelled();
         refreshTasks();
       }
     } catch {
@@ -595,6 +699,7 @@ async function cancelTask() {
     await refreshTasks();
     renderSelectedFile();
     renderEvents();
+    renderCancelled();
     showToast("任务已取消");
   } catch (error) {
     showToast(error.message, "error");

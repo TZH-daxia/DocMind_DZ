@@ -12,17 +12,20 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.agent.gateway import build_gateway
 from app.config import Settings
 from app.schemas.documents import TaskSnapshot, WorkflowEvent
 from app.schemas.file import UploadedDocument
 from app.schemas.submit import SubmitRequest, SubmitResponse
+from app.service.gates import ConcurrencyGates
 from app.service.pipeline import Pipeline, PipelineError
 from app.storage.file_store import FileStore
 from app.workflow.errors import TaskCancelledError, TaskPausedError
-from app.workflow.graph import NODE_ORDER, AnalysisGraph
+
+if TYPE_CHECKING:
+    from app.workflow.graph import AnalysisGraph
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +87,8 @@ class TaskService:
         self.store = FileStore(settings)
         self._running: dict[str, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
-        self._task_gate = asyncio.Semaphore(settings.max_concurrent_tasks)
+        # 进程内并发闸门：任务 / 模型 / Office 转 PDF 共用一套，便于统一观测排队
+        self.gates = ConcurrencyGates()
         self.gateway: Any = None
         self.pipeline: Pipeline | None = None
         self.graph: AnalysisGraph | None = None
@@ -97,8 +101,21 @@ class TaskService:
             logger.warning("模型未配置：%s", exc)
 
     def _build_model_layers(self) -> None:
-        self.gateway = build_gateway(self.settings)
+        self.gateway = build_gateway(self.settings, gates=self.gates)
         self.pipeline = Pipeline(self.settings, self.store, self.gateway)
+        self.pipeline.gates = self.gates
+
+    def _ensure_graph(self) -> None:
+        """惰性构建工作流图。
+
+        `langgraph` 导入约 0.4s，只有真正跑任务才需要；放到第一次 start 时再付，
+        让每次重启服务省掉这部分导入时间。
+        """
+
+        if self.graph is not None:
+            return
+        from app.workflow.graph import NODE_ORDER, AnalysisGraph
+
         self.graph = AnalysisGraph(
             {name: getattr(self.pipeline, name) for name in NODE_ORDER}
         )
@@ -112,6 +129,11 @@ class TaskService:
         files = uploads if isinstance(uploads, list) else [uploads]
         if not files:
             raise TaskError("FILE_EMPTY", "请至少上传一个文件")
+        if len(files) > self.settings.max_upload_files:
+            raise TaskError(
+                "FILE_COUNT_EXCEEDED",
+                f"单次最多上传 {self.settings.max_upload_files} 个文件，请重新选择",
+            )
         for upload in files:
             self._validate_upload(upload)
 
@@ -165,7 +187,7 @@ class TaskService:
         return snapshot
 
     def start(self, task_id: str) -> None:
-        if self.graph is None or self.pipeline is None:
+        if self.pipeline is None:
             status = self._read_status(task_id)
             status.update(
                 status="failed",
@@ -179,6 +201,7 @@ class TaskService:
             )
             self._write_status(task_id, status)
             return
+        self._ensure_graph()
         if task_id in self._running and not self._running[task_id].done():
             return
         status = self._read_status(task_id)
@@ -193,18 +216,47 @@ class TaskService:
     # ------------------------------------------------------------ 执行
     async def _run(self, task_id: str) -> None:
         status = self._read_status(task_id)
-        status.update(
-            status="running",
-            step="开始处理",
-            progress=1,
-            error=None,
-            interrupt_requested=None,
-        )
-        self._write_status(task_id, status)
-        state = self._build_state(task_id, status)
+        if status.get("status") in TERMINAL_STATUSES:
+            return
+        waiting = self.gates.waiting("task")
+        if waiting:
+            await self.emit_event(
+                task_id,
+                "排队调度",
+                f"等待执行槽位（前面 {waiting} 个任务）",
+                int(status.get("progress") or 0),
+            )
+        queued_at = time.perf_counter()
+        update: dict[str, Any] = {}
         try:
             assert self.graph is not None
-            async with self._task_gate:
+            # 排队期间快照保持 queued（与 docmind 一致），拿到槽位后才切 running
+            async with self.gates.acquire(
+                "task", self.settings.max_concurrent_tasks
+            ) as ahead:
+                waited = time.perf_counter() - queued_at
+                status = self._read_status(task_id)
+                if status.get("status") in TERMINAL_STATUSES:
+                    return
+                if status.get("interrupt_requested"):
+                    self._park_task(task_id, self._interrupt_kind(task_id))
+                    return
+                status.update(
+                    status="running",
+                    step="开始处理",
+                    progress=1,
+                    error=None,
+                    interrupt_requested=None,
+                )
+                self._write_status(task_id, status)
+                if waited >= 1 or ahead:
+                    await self.emit_event(
+                        task_id,
+                        "排队调度",
+                        f"排队 {waited:.1f} 秒后获得执行槽位",
+                        1,
+                    )
+                state = self._build_state(task_id, status)
                 update = await self.graph.ainvoke(state)  # type: ignore[arg-type]
         except TaskPausedError:
             # 节点入口命中暂停：状态已由 pause_task 落盘，这里幂等收尾
@@ -297,6 +349,7 @@ class TaskService:
         )
         if comparisons_doc:
             state["comparisons"] = comparisons_doc.get("comparisons", [])
+            state["totals_checks"] = comparisons_doc.get("totals_checks", [])
             state["summary"] = comparisons_doc.get("summary", {})
             state["warnings"] = list(
                 dict.fromkeys(
@@ -393,7 +446,9 @@ class TaskService:
             return 1
 
     def get_snapshot(self, task_id: str) -> TaskSnapshot:
-        return TaskSnapshot(**self._read_status(task_id))
+        snapshot = TaskSnapshot(**self._read_status(task_id))
+        snapshot.result_available = self.store.result_path(task_id).exists()
+        return snapshot
 
     def list_tasks(self) -> list[TaskSnapshot]:
         snapshots: list[TaskSnapshot] = []
@@ -404,9 +459,13 @@ class TaskService:
             data = self.store.read_json_or_none(status_path)
             if isinstance(data, dict):
                 try:
-                    snapshots.append(TaskSnapshot(**data))
+                    snapshot = TaskSnapshot(**data)
                 except ValueError:
                     continue
+                snapshot.result_available = self.store.result_path(
+                    snapshot.task_id
+                ).exists()
+                snapshots.append(snapshot)
         snapshots.sort(key=lambda item: item.created_at, reverse=True)
         return snapshots
 
@@ -526,43 +585,6 @@ class TaskService:
             return legacy
         raise TaskError("PAGE_NOT_FOUND", f"第 {index} 页图片不存在", http_status=404)
 
-    def delete_task(self, task_id: str) -> None:
-        task = self._running.get(task_id)
-        if task is not None and not task.done():
-            raise TaskError("TASK_RUNNING", "任务正在执行，无法删除", http_status=409)
-        if not self.store.delete_task(task_id):
-            raise TaskNotFoundError(task_id)
-
-    def retry_task(self, task_id: str) -> TaskSnapshot:
-        task = self._running.get(task_id)
-        if task is not None and not task.done():
-            raise TaskError("TASK_RUNNING", "任务正在执行，无法重试", http_status=409)
-        status = self._read_status(task_id)
-        for path in (
-            self.store.pages_path(task_id),
-            self.store.segments_path(task_id),
-            self.store.house_bills_path(task_id),
-            self.store.manifest_path(task_id),
-            self.store.comparisons_path(task_id),
-            self.store.result_path(task_id),
-            self.store.process_log_path(task_id),
-            self.store.submission_path(task_id),
-        ):
-            path.unlink(missing_ok=True)
-        status.update(
-            status="queued",
-            step="已排队（重试）",
-            progress=0,
-            error=None,
-            finished_at=None,
-            submitted=False,
-            submitted_at=None,
-            submission_code=None,
-        )
-        self._write_status(task_id, status)
-        self.start(task_id)
-        return TaskSnapshot(**status)
-
     # ------------------------------------------------------------ 中断控制
     def pause_task(self, task_id: str) -> TaskSnapshot:
         """暂停在途任务：落 paused 并中断当前 await，已产出的节点保留。"""
@@ -668,7 +690,7 @@ class TaskService:
             raise TaskError(
                 "FILE_TYPE_NOT_SUPPORTED",
                 f"暂不支持的文件类型：{suffix or '无后缀'}，"
-                "支持 PDF / Word / Excel / 图片",
+                "支持 PDF / Word / Excel",
             )
         if upload.size == 0:
             raise TaskError("FILE_EMPTY", "上传文件为空")

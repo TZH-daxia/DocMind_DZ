@@ -25,5 +25,6 @@ class AnalysisState(TypedDict, total=False):
     house_bills: list[dict[str, Any]]
     manifest: dict[str, Any] | None
     comparisons: list[dict[str, Any]]
+    totals_checks: list[dict[str, Any]]
     summary: dict[str, Any]
     result: dict[str, Any]

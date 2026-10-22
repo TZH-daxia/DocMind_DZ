@@ -65,19 +65,10 @@ def test_xlsx_parser_flattens_sheets(settings, tmp_path: Path):
     assert "HAWB0001 | PVG | LAX" in parsed.pages[0].text
 
 
-def test_image_parser_creates_page(settings, tmp_path: Path):
-    from PIL import Image
-
-    source = tmp_path / "scan.png"
-    Image.new("RGB", (300, 200), "white").save(source)
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-    parsed = build_default_registry().get(".png").parse(source, out_dir, settings)
-
-    assert len(parsed.pages) == 1
-    assert parsed.pages[0].text == ""
-    assert parsed.pages[0].image_path is not None
-    assert parsed.pages[0].image_path.exists()
+def test_image_extension_is_rejected():
+    with pytest.raises(ParserError) as excinfo:
+        build_default_registry().get(".png")
+    assert excinfo.value.code == "FILE_TYPE_NOT_SUPPORTED"
 
 
 def test_unsupported_extension_raises():

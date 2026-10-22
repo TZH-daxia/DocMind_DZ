@@ -145,6 +145,18 @@ def test_hawb_number_not_confused_with_title():
     assert find_hawb_no("HOUSE AIR WAYBILL\nHAWB NO.: SHA1234567\n") == "SHA1234567"
 
 
+def test_air_waybill_title_without_hawb_is_master():
+    text = "Air Waybill\nNot Negotiable\n272-76217971\nPVG\nDFW\n"
+    signal = detect_master_bill(text)
+    assert signal.is_master is True
+    assert signal.master_no == "272-76217971"
+
+
+def test_air_waybill_title_with_hawb_is_house():
+    text = "Air Waybill\nHAWB NO.: EDC2037060\n272-76217971\n"
+    assert detect_master_bill(text).is_master is False
+
+
 def test_continuation_page_merges_into_previous_house_bill():
     pages = [
         (1, house_page("HAWB0001")),

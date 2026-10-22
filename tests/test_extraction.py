@@ -31,18 +31,32 @@ def test_alias_keys_are_normalized():
     result = _normalize_house_bill_payload(payload)
     fields = result["fields"]
 
-    assert fields["hawb_no"] == "SHA1234567"
-    assert fields["origin_port"] == "PVG"
-    assert fields["dest_port"] == "LAX"
-    assert fields["flight_no"] == "CA 1234"
-    assert fields["flight_date"] == "20OCT2026"
-    assert fields["pieces"] == "12"
-    assert fields["weight"] == "186.5 KG"
-    assert fields["volume"] == "1.20"
-    assert fields["shipper_name"] == "SHANGHAI EXAMPLE CO"
-    assert fields["consignee_name"] == "EXAMPLE TRADING INC."
-    assert fields["consignee_phone"] == "+1 213 555 0100"
-    assert fields["consignee_email"] == "CONSIGNEE@EXAMPLE.COM"
+    assert fields["hawb"] == "SHA1234567"
+    assert fields["sfg"] == "PVG"
+    assert fields["mdg"] == "LAX"
+    assert fields["hbh"] == "CA 1234"
+    assert fields["hbrq"] == "20OCT2026"
+    assert fields["companytitle_fhr_hawb"] == "SHANGHAI EXAMPLE CO"
+    assert fields["companytitle_shr_hawb"] == "EXAMPLE TRADING INC."
+    assert fields["phone_shr_hawb"] == "12135550100"
+    assert fields["email_shr_hawb"] == "CONSIGNEE@EXAMPLE.COM"
+
+
+def test_phone_drops_plus_and_china_prefix():
+    """手机号只留数字：+86 开头去掉 86，其余只去掉 +。"""
+
+    fields = _normalize_house_bill_payload(
+        {
+            "fields": {
+                "hawb": "HAWB0001",
+                "phone_fhr_hawb": "+8651257382098",
+                "phone_shr_hawb": "+18649636328",
+            }
+        }
+    )["fields"]
+
+    assert fields["phone_fhr_hawb"] == "51257382098"
+    assert fields["phone_shr_hawb"] == "18649636328"
 
 
 def test_canonical_payload_keeps_standard_structure():
@@ -76,8 +90,41 @@ async def test_manifest_accepts_raw_array_response():
     result = await extract_manifest(_FakeArrayGateway(), pages, [1])
     assert len(result["entries"]) == 1
     assert result["entries"][0]["fields"]["hawb_no"] == "HAWB0001"
-    assert result["entries"][0]["fields"]["origin_port"] == "PVG"
     assert result["entries"][0]["fields"]["pieces"] == "12"
+    # 舱单只保留核对字段，始发港等不再输出
+    assert "origin_port" not in result["entries"][0]["fields"]
+
+
+class _FakeManifestDestinationGateway:
+    async def complete(self, label, system_prompt, human_prompt):
+        return json.dumps(
+            {
+                "entries": [
+                    {
+                        "line_no": 1,
+                        "fields": {
+                            "hawb_no": "HAWB0001",
+                            "dest_port": "DFW",
+                            "chargeable_weight": "2061.00",
+                            "pieces": "5",
+                        },
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+
+async def test_manifest_keeps_destination_and_chargeable_weight():
+    """舱单口径的 dest_port/chargeable_weight 不能被分单接口名映射吃掉。"""
+
+    pages = [PageRecord(index=1, text="CARGO MANIFEST")]
+    result = await extract_manifest(_FakeManifestDestinationGateway(), pages, [1])
+    fields = result["entries"][0]["fields"]
+
+    assert fields["dest_port"] == "DFW"
+    assert fields["chargeable_weight"] == "2061.00"
+    assert fields["pieces"] == "5"
 
 
 class _FakeMasterRowGateway:

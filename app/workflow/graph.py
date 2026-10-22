@@ -32,6 +32,18 @@ def _first_pending_node(state: AnalysisState) -> str:
     return END
 
 
+def _route_after_classify(state: AnalysisState) -> str:
+    """没有分单段（例如整份文件只有主单）时，直接跳到结果装配。
+
+    主单只登记不抽取，继续走抽取/核对节点没有意义，日志里也不该出现这两步。
+    """
+
+    segments = state.get("segments") or ()
+    if any(item.get("kind") == "house_bill" for item in segments):
+        return "extract_documents"
+    return "build_result"
+
+
 class AnalysisGraph:
     def __init__(self, handlers: dict[str, NodeHandler]) -> None:
         graph = StateGraph(AnalysisState)
@@ -53,7 +65,17 @@ class AnalysisGraph:
             )
         graph.set_conditional_entry_point(_first_pending_node)
         for index in range(len(NODE_SEQUENCE) - 1):
-            graph.add_edge(NODE_SEQUENCE[index][0], NODE_SEQUENCE[index + 1][0])
+            source = NODE_SEQUENCE[index][0]
+            target = NODE_SEQUENCE[index + 1][0]
+            if source == "classify_pages":
+                # 只有主单（无分单）时跳过抽取与核对，直接装配结果
+                graph.add_conditional_edges(
+                    source,
+                    _route_after_classify,
+                    {"extract_documents": target, "build_result": "build_result"},
+                )
+            else:
+                graph.add_edge(source, target)
         graph.add_edge(NODE_SEQUENCE[-1][0], END)
         self.graph = graph.compile()
 
