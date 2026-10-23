@@ -60,6 +60,12 @@ def format_startup_banner(current: Settings) -> str:
     primary = hosts[0]
     log_path = (Path(current.log_dir) / LOG_FILE_NAME).resolve()
     data_path = Path(current.data_root).resolve()
+    # 实时看日志的命令随平台给出：部署在 Linux 容器里时 PowerShell 写法不可用
+    watch_log = (
+        f"Get-Content {log_path} -Wait -Tail 20"
+        if os.name == "nt"
+        else f"tail -f {log_path}"
+    )
     lines = [
         f"{current.app_name} 已启动",
         f"  前端页面：http://{primary}:{port}/",
@@ -73,7 +79,7 @@ def format_startup_banner(current: Settings) -> str:
             f"  健康检查：http://{primary}:{port}/health",
             f"  系统日志：{log_path}",
             f"  任务数据：{data_path / 'tasks'}",
-            "  （实时查看日志：Get-Content <系统日志路径> -Wait -Tail 20）",
+            f"  （实时查看日志：{watch_log}）",
         ]
     )
     return "\n".join(lines)

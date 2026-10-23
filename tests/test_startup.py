@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -28,6 +29,8 @@ def test_startup_banner_lists_addresses_and_paths(tmp_path: Path) -> None:
     assert str((tmp_path / "data" / "tasks").resolve()) in banner
     # 模型模式不再展示在终端横幅里（改由启动日志记录）
     assert "模型模式" not in banner
+    # 实时看日志的命令按平台给：Linux（容器部署）不能用 PowerShell 写法
+    assert ("Get-Content" if os.name == "nt" else "tail -f") in banner
     # 绑 0.0.0.0 时，除回环地址外还给出局域网地址（本机取不到网卡 IP 时跳过）
     if _local_ipv4_addresses():
         assert "局域网访问：" in banner

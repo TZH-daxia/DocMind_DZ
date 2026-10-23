@@ -21,6 +21,9 @@ data/
 logs/
 *.log
 
+# ---- 证书（独立部署时才会用到，含私钥，切勿提交）----
+deploy/nginx/certs/
+
 # ---- 编辑器 / 系统 ----
 .idea/
 .vscode/

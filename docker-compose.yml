@@ -1,0 +1,92 @@
+# DocMind DZ 部署编排：应用容器 + 项目自带 nginx 入口。
+#
+# 与同机的 DocMind（8443）、官网、客服**零交集**：不共用 nginx、
+# 不占用它们的 80/443、不加入它们的 Docker 网络（项目名 different，网络天然隔离）。
+#
+# 使用：
+#   docker compose up -d --build
+#   docker compose ps
+#
+# 对外地址：https://ai.wecanintl.com:8444/dz/...
+services:
+  docmind-dz:
+    build:
+      context: .
+      args:
+        # uv.lock 记录的是 pypi.org；国内服务器构建慢时换成清华/阿里源
+        UV_INDEX_URL: ${UV_INDEX_URL:-}
+        # Debian 官方源拉取慢时，改成 mirrors.tuna.tsinghua.edu.cn 或 mirrors.aliyun.com
+        APT_MIRROR: ${APT_MIRROR:-}
+    image: docmind-dz:latest
+    container_name: docmind-dz
+    restart: unless-stopped
+    ports:
+      # 只绑回环地址，纯给宿主上调试用（curl /health、SSH 隧道看前端）。
+      # 线上流量走本项目的 docker 网络直达 gateway，不经过这个端口。
+      - "127.0.0.1:${HOST_PORT:-8010}:8010"
+    env_file:
+      - .env
+    environment:
+      # 容器内必须监听 0.0.0.0；下面几项与 Dockerfile 保持一致，
+      # 同时覆盖 .env 里面向本地开发的相对路径与 127.0.0.1
+      DOCMIND_DZ_APP_HOST: "0.0.0.0"
+      DOCMIND_DZ_APP_PORT: "8010"
+      DOCMIND_DZ_DATA_ROOT: "/app/data"
+      DOCMIND_DZ_LOG_DIR: "/app/logs"
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # 直接绑到项目目录：上传原件、页面图、分析结果、日志在宿主机上都能直接翻看。
+      # 容器以 uid/gid 10001 运行，且绑定挂载**不会**自动改属主，
+      # 所以这两个目录必须先建好并交给该用户（见 DEPLOY.md）：
+      #   mkdir -p data logs && chown -R 10001:10001 data logs
+      # 需要放到独立数据盘时，把左边换成绝对路径即可（如 /data/docmind-dz/data）。
+      - ./data:/app/data
+      - ./logs:/app/logs
+    # LibreOffice（soffice）与页面光栅化会用到共享内存，默认 64MB 偏小
+    shm_size: 512mb
+    # soffice 会派生 soffice.bin：给 PID 1 一个真正的 init 回收子进程，避免僵尸
+    init: true
+    # SIGTERM 后留出收尾时间（uvicorn 自身最多等 5s，剩下留给 soffice 子进程）
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    # 资源上限：防止异常情形把宿主机吃光。并发瓶颈在 CPU 核数与上游模型限流，
+    # 不在内存，机器更大时按需上调（每个 soffice 约 200~400MB）。
+    deploy:
+      resources:
+        limits:
+          memory: 16g
+          # 需要给宿主机留出明确余量时再打开，值建议 = CPU 核数
+          # cpus: "4.0"
+    logging:
+      # 容器 stdout 只有启动横幅与少量告警；应用日志写在宿主机 ./logs/app.log
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # DocMind DZ 专属入口：与同机其它站点的 nginx 完全无关，也不占用它们的 80/443。
+  # 容器内监听 443，宿主端口由 DOCMIND_DZ_HTTPS_PORT 决定（默认 8444）。
+  gateway:
+    image: nginx:alpine
+    container_name: docmind-dz-gateway
+    restart: unless-stopped
+    ports:
+      # 只映射 HTTPS；80 不映射（标准 80 被别处占着，也没有跳转的必要）
+      - "${DOCMIND_DZ_HTTPS_PORT:-8444}:443"
+    depends_on:
+      - docmind-dz
+    volumes:
+      # 覆盖镜像自带的 default.conf：我们的文件是完整 server 块，
+      # conf.d/*.conf 在 http 级被 include，放这里正好
+      - ./deploy/nginx/dz.conf:/etc/nginx/conf.d/default.conf:ro
+      # 复用现成的泛域名证书（*.wecanintl.com 已覆盖 ai.wecanintl.com），只读挂载，
+      # 证书续期后自动生效，不用重新拷贝。
+      # 想彻底拷贝一份到自己项目时，换成 ./deploy/nginx/certs 并自行同步，
+      # 但要记得：证书续期后必须重新拷贝，否则到期会报证书过期。
+      - /data/docker/freight-agent/nginx/certs:/etc/nginx/certs:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
