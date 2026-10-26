@@ -28,6 +28,49 @@ MAX_QUERY_CHARS = 40
 MIN_TOKEN_LEN = 3
 # 标签与值的最大可接受距离（PDF 点，页面高约 842）：超过视为「不是同一栏」
 MAX_LABEL_DISTANCE = 260.0
+# 值命中与原文引用锚点的最大距离：超过视为不是同一处，回退到标签逻辑
+QUOTE_ANCHOR_DISTANCE = 300.0
+# 参与人栏位锚点：先定位公司名/地址，供同栏城市等字段判断左右栏
+PARTY_ANCHOR_PREFIXES = ("companytitle_", "address_")
+
+# 国家二字码 → 单证上常见的全称写法（单证多印全称，抽取结果却是编码）
+COUNTRY_NAME_ALIASES: dict[str, tuple[str, ...]] = {
+    "CN": ("CHINA", "P.R. CHINA", "PRC"),
+    "HK": ("HONG KONG",),
+    "TW": ("TAIWAN",),
+    "MO": ("MACAO", "MACAU"),
+    "US": ("UNITED STATES", "USA", "U.S.A."),
+    "MX": ("MEXICO",),
+    "CA": ("CANADA",),
+    "BR": ("BRAZIL",),
+    "DE": ("GERMANY",),
+    "GB": ("UNITED KINGDOM", "ENGLAND", "UK"),
+    "FR": ("FRANCE",),
+    "IT": ("ITALY",),
+    "ES": ("SPAIN",),
+    "NL": ("NETHERLANDS",),
+    "BE": ("BELGIUM",),
+    "PL": ("POLAND",),
+    "SE": ("SWEDEN",),
+    "CH": ("SWITZERLAND",),
+    "AT": ("AUSTRIA",),
+    "CZ": ("CZECH REPUBLIC", "CZECH"),
+    "RU": ("RUSSIA",),
+    "TR": ("TURKEY",),
+    "AE": ("UNITED ARAB EMIRATES", "UAE"),
+    "SA": ("SAUDI ARABIA",),
+    "IN": ("INDIA",),
+    "VN": ("VIETNAM",),
+    "TH": ("THAILAND",),
+    "MY": ("MALAYSIA",),
+    "SG": ("SINGAPORE",),
+    "ID": ("INDONESIA",),
+    "PH": ("PHILIPPINES",),
+    "JP": ("JAPAN",),
+    "KR": ("SOUTH KOREA", "KOREA"),
+    "AU": ("AUSTRALIA",),
+    "NZ": ("NEW ZEALAND",),
+}
 
 # 版式栏位名 → 分单字段；用于把搜索限制在该栏附近
 FIELD_LABEL_HINTS: dict[str, tuple[str, ...]] = {
@@ -37,6 +80,7 @@ FIELD_LABEL_HINTS: dict[str, tuple[str, ...]] = {
     "sfg": ("AIRPORT OF DEPARTURE",),
     "mdg": ("AIRPORT OF DESTINATION",),
     "hbh": ("REQUESTED FLIGHT/DATE", "REQUESTED FLIGHT"),
+    "currency": ("CURRENCY",),
     "hbrq": ("REQUESTED FLIGHT/DATE", "REQUESTED FLIGHT"),
     # 分单上的 "No. Of Pieces RCP" 常被拆成三行，整串搜也能跨行命中；
     # 只留较短的标签，避免版式变化后一个都匹配不上
@@ -115,14 +159,29 @@ def _date_variants(value: str) -> list[str]:
         f"{parsed.day:02d}{month}{parsed.year}",  # 30SEP2026
         f"{parsed.day:02d}/{parsed.month:02d}/{parsed.year}",
         f"{parsed.day:02d}.{parsed.month:02d}.{parsed.year}",
+        # 航班日期常只印“日”（如 `5Y518/22`），最后才退回两位日；靠版式标签锚定
+        f"{parsed.day:02d}",
     ]
 
 
-def _alignment_score(label: Any, rect: Any) -> float:
-    """越小越可信：值与标签水平对齐、且紧挨在标签下方。"""
+def _same_column(rect: Any, anchor: Any, page_width: float) -> bool:
+    """两个矩形是否在同一栏：水平有重叠，或中心 x 足够接近。"""
 
-    if rect.intersects(label):
-        return float("inf")
+    overlap = min(rect.x1, anchor.x1) - max(rect.x0, anchor.x0)
+    if overlap > 0:
+        return True
+    rect_center = (rect.x0 + rect.x1) / 2
+    anchor_center = (anchor.x0 + anchor.x1) / 2
+    return abs(rect_center - anchor_center) <= page_width * 0.15
+
+
+def _alignment_score(label: Any, rect: Any) -> float:
+    """越小越可信：值与标签水平对齐、且紧挨在标签下方。
+
+    值与标签框重叠在紧凑版式里很常见（小字号、标签紧贴值），不能直接判死；
+    只按中心距离打分，重叠时垂直距离记 0。
+    """
+
     label_center = (label.x0 + label.x1) / 2
     rect_center = (rect.x0 + rect.x1) / 2
     horizontal = abs(label_center - rect_center)
@@ -135,14 +194,39 @@ def _alignment_score(label: Any, rect: Any) -> float:
     return horizontal + vertical * 1.5
 
 
-def _pick_city_rect(page: Any, hits: list[Any]) -> Any:
-    """城市值通常与邮编/国家同一行（地址块最后一行），优先选这种命中。"""
+def _pick_city_rect(
+    page: Any, hits: list[Any], anchor: dict[str, float] | None = None
+) -> Any:
+    """城市值优先选「同一栏 + 紧邻地址块」的命中。
 
+    AWB 同一栏里城市名会出现多次（发货人地址、代理地址、页脚签章），
+    只按“同行有邮编”选会指到代理栏；用同栏地址的定位结果做锚点：
+    先取地址块正下方同列缩进的命中，再退回水平最近。
+    """
+
+    candidates = hits
+    if anchor:
+        x0 = anchor.get("x0", 0.0)
+        y1 = anchor.get("y1", 0.0)
+        block = [
+            rect
+            for rect in hits
+            if abs(rect.x0 - x0) <= 60 and y1 - 5 <= rect.y0 <= y1 + 120
+        ]
+        if block:
+            candidates = block
+        else:
+            center = anchor.get("xc", x0)
+            near = [
+                rect for rect in hits if abs((rect.x0 + rect.x1) / 2 - center) <= 150
+            ]
+            if near:
+                candidates = near
     try:
         words = page.get_text("words")
     except Exception:  # noqa: BLE001 - 页面解析异常时退回第一处
-        return hits[0]
-    for rect in hits:
+        return candidates[0]
+    for rect in candidates:
         # 只认同一行、且紧跟在城市右侧的词（邮编/国家），避免把上方或下方行算进来
         same_row = [
             word
@@ -156,7 +240,12 @@ def _pick_city_rect(page: Any, hits: list[Any]) -> Any:
             for word in same_row
         ):
             return rect
-    return hits[0]
+    if anchor:
+        center = anchor.get("xc", anchor.get("x0", 0.0))
+        return min(
+            candidates, key=lambda rect: abs((rect.x0 + rect.x1) / 2 - center)
+        )
+    return candidates[0]
 
 
 def _merge_date_hits(page: Any, hits: list[Any]) -> list[Any]:
@@ -216,7 +305,101 @@ def _exact_word_hits(page: Any, value: str) -> list[Any]:
         return []
 
 
-def _locate_one(page: Any, key: str, value: str) -> list[Any]:
+def _plain_quote(text: str) -> str:
+    """把 VLM 输出的 Markdown 引用还原成可在 PDF 文本层检索的纯文本。"""
+
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"[|*#`>]+", " ", text)
+    text = text.replace("\u3000", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _quote_segments(text: str) -> list[str]:
+    """把引用切成较长的片段，用于整条匹配失败时找唯一锚点。"""
+
+    plain = _plain_quote(text)
+    segments = [
+        item.strip(" ,;:()[]{}")
+        for item in re.split(r"[\s,;:()|/]+", plain)
+    ]
+    # 太短的片段容易多命中，按长度降序只保留较长且有区分度的
+    unique = {item for item in segments if 6 <= len(item) <= 40}
+    return sorted(unique, key=len, reverse=True)[:8]
+
+
+def _box_distance(rect: Any, anchor: Any) -> float:
+    """两个矩形的中心距离。"""
+
+    rect_x = (rect.x0 + rect.x1) / 2
+    rect_y = (rect.y0 + rect.y1) / 2
+    anchor_x = (anchor.x0 + anchor.x1) / 2
+    anchor_y = (anchor.y0 + anchor.y1) / 2
+    return ((rect_x - anchor_x) ** 2 + (rect_y - anchor_y) ** 2) ** 0.5
+
+
+def _quote_boxes(page: Any, quote: str | None) -> list[Any]:
+    """用原文引用在页面上找锚点：整条 → 去 Markdown → 唯一片段。"""
+
+    if not quote or not quote.strip():
+        return []
+    for query in (quote.strip(), _plain_quote(quote)):
+        if len(query) < 3:
+            continue
+        try:
+            rects = page.search_for(query)
+        except Exception:  # noqa: BLE001 - 单条引用检索失败不影响其他候选
+            rects = []
+        if rects:
+            return rects
+    # 整条匹配不上（标签与值跨块、换行差异）：用能唯一定位的片段作锚点
+    for segment in _quote_segments(quote):
+        try:
+            rects = page.search_for(segment)
+        except Exception:  # noqa: BLE001
+            continue
+        if len(rects) == 1:
+            return rects
+    return []
+
+
+def _prefix_hits(page: Any, value: str) -> list[Any]:
+    """长值（品名/地址）在页面被换行拆开时，用可命中的最长前缀兜底。
+
+    例：模型输出 `..._BRK_ASM_ HS CODE`，页面实际是 `..._BRK` 换行 `_ASM_`，
+    整串与所有变体都搜不到；截到 `..._BRK` 仍能指示位置。
+    """
+
+    text = value.strip()
+    if len(text) < 12:
+        return []
+    step = max(4, len(text) // 20)
+    for size in range(len(text) - 1, 7, -step):
+        rects = page.search_for(text[:size])
+        if rects:
+            return rects
+    return []
+
+
+def _country_hits(page: Any, value: str) -> list[Any]:
+    """国家栏：整词匹配编码，同时补上该编码对应的国家全称（单证多印全称）。"""
+
+    hits = _exact_word_hits(page, value)
+    probe = value.strip().upper()
+    for name in COUNTRY_NAME_ALIASES.get(probe, ()):
+        try:
+            hits.extend(page.search_for(name))
+        except Exception:  # noqa: BLE001 - 单个名称搜索失败不影响其他候选
+            continue
+    return hits
+
+
+def _locate_one(
+    page: Any,
+    key: str,
+    value: str,
+    anchor: dict[str, float] | None = None,
+    quote_boxes: list[Any] | None = None,
+) -> list[Any]:
     """在单页上定位一个字段，返回最多 MAX_BOXES 个矩形。"""
 
     queries = _query_variants(value) + _date_variants(value)
@@ -224,7 +407,7 @@ def _locate_one(page: Any, key: str, value: str) -> list[Any]:
         return []
     hits: list[Any] = []
     if key.startswith("companycode_"):
-        hits = _exact_word_hits(page, value)
+        hits = _country_hits(page, value)
     for query in queries:
         if hits:
             break
@@ -233,31 +416,93 @@ def _locate_one(page: Any, key: str, value: str) -> list[Any]:
             hits = rects
             break
     if not hits:
+        # 整串/变体都搜不到时，品名这类长值可能被换行拆开，用最长前缀兜底
+        hits = _prefix_hits(page, value)
+    if not hits:
         return []
     if key == "hbrq" or key.endswith("_date"):
         hits = _merge_date_hits(page, hits)
 
+    width = float(page.rect.width)
+
+    # 有原文引用时优先在引用附近取值：比版式标签更能区分同名值的不同栏位。
+    # 但要求值与引用锚点在同一栏/同一行，左右栏的同名值不能仅凭距离入选。
+    if quote_boxes:
+        anchor_box = quote_boxes[0]
+        candidates = [
+            rect
+            for rect in hits
+            if _same_column(rect, anchor_box, width)
+            and _row_distance(anchor_box, rect) <= 160
+        ]
+        if candidates:
+            return [min(candidates, key=lambda rect: _box_distance(rect, anchor_box))]
+        # 引用与所有命中都不同栏：不要用引用强行选，继续按版式标签定位
+
     # 城市没有可靠的表头锚点（"City" 可能出现在别处），用「同行有邮编/国家」判定
     if key.endswith("_city") or key.startswith("city_"):
-        return [_pick_city_rect(page, hits)]
+        return [_pick_city_rect(page, hits, anchor)]
 
     labels: list[Any] = []
     for hint in FIELD_LABEL_HINTS.get(key, ()):
         labels.extend(page.search_for(hint))
     if not labels:
-        # 没有版式标签可锚定（如地址、品名）：只能取第一处命中
-        return hits[:MAX_BOXES]
+        # 没有版式标签：唯一命中可以框；同名值多处时不随便取第一处，
+        # 有引用锚点时退而取离锚点最近的一处，否则不框
+        if len(hits) == 1:
+            return hits
+        if quote_boxes:
+            return [min(hits, key=lambda rect: _box_distance(rect, quote_boxes[0]))]
+        return []
 
     scored = []
     for rect in hits:
-        score = min(_alignment_score(label, rect) for label in labels)
-        if score < MAX_LABEL_DISTANCE:
+        best_label = min(labels, key=lambda label: _alignment_score(label, rect))
+        score = _alignment_score(best_label, rect)
+        # 必须与标签同栏（或同一行），否则同名值会被选到隔壁栏
+        if score < MAX_LABEL_DISTANCE and (
+            _same_column(rect, best_label, width)
+            or _row_distance(best_label, rect) <= 24
+        ):
             scored.append((score, rect))
     if not scored:
         # 标签附近找不到可信位置：宁可不框，也不要框错
         return []
     scored.sort(key=lambda item: item[0])
     return [scored[0][1]]
+
+
+def _block_containing(page: Any, rect: Any) -> Any:
+    """返回包含给定矩形的文本块 bbox（标签所在栏位）。"""
+
+    import pymupdf
+
+    try:
+        blocks = page.get_text("blocks")
+    except Exception:  # noqa: BLE001 - 取不到块时退回 None
+        return None
+    for block in blocks:
+        box = pymupdf.Rect(block[:4])
+        if box.width <= rect.width or box.height <= rect.height:
+            continue
+        if box.contains(rect):
+            return box
+    return None
+
+
+def _join_words(words: list[Any]) -> str:
+    """把词按行拼接成一行文本（同 y 为一组，组内按 x 排序）。"""
+
+    rows: dict[int, list[Any]] = {}
+    for word in words:
+        rows.setdefault(round(float(word[1]) / 2), []).append(word)
+    lines: list[str] = []
+    for key in sorted(rows):
+        ordered = sorted(rows[key], key=lambda item: item[0])
+        line = " ".join(str(item[4]) for item in ordered).strip()
+        if line:
+            lines.append(line)
+    return " ".join(lines)
 
 
 def _card_candidates(
@@ -392,6 +637,7 @@ def locate_fields(
     pdf_path: Path,
     page_map: dict[int, int],
     fields: dict[str, str | None],
+    quotes: dict[str, str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """在 PDF 中定位字段值。
 
@@ -412,16 +658,34 @@ def locate_fields(
         return {}
 
     locations: dict[str, list[dict[str, Any]]] = {}
+    # 收发货人两栏常出现同名城市：先定位公司名/地址，作为同栏锚点
+    ordered = sorted(
+        fields.items(),
+        key=lambda item: 0 if item[0].startswith(PARTY_ANCHOR_PREFIXES) else 1,
+    )
+    anchors: dict[str, dict[str, float]] = {}
     try:
         with pymupdf.open(pdf_path) as pdf:
-            for key, value in fields.items():
+            for key, value in ordered:
                 if not value or not str(value).strip():
                     continue
+                party = key.split("_", 1)[1] if "_" in key else ""
+                rects: list[Any] = []
                 for global_index, page_no in page_map.items():
                     if page_no < 1 or page_no > pdf.page_count:
                         continue
                     page = pdf.load_page(page_no - 1)
-                    rects = _locate_one(page, key, str(value))
+                    quote_boxes = _quote_boxes(page, (quotes or {}).get(key))
+                    rects = _locate_one(
+                        page,
+                        key,
+                        str(value),
+                        anchor=anchors.get(party),
+                        quote_boxes=quote_boxes,
+                    )
+                    if not rects and len(quote_boxes) == 1:
+                        # 值本身定位不到（被改写/换行异常）时，退化为引用片段的位置
+                        rects = quote_boxes
                     if not rects:
                         continue
                     width = float(page.rect.width)
@@ -435,8 +699,127 @@ def locate_fields(
                         }
                         for rect in rects[:MAX_BOXES]
                     ]
+                    if key.startswith(PARTY_ANCHOR_PREFIXES):
+                        first = rects[0]
+                        # 地址块比公司名更能代表这一栏的范围（城市在其正下方）
+                        if key.startswith("address_") or party not in anchors:
+                            anchors[party] = {
+                                "x0": first.x0,
+                                "xc": (first.x0 + first.x1) / 2,
+                                "y1": first.y1,
+                            }
                     break
     except Exception as exc:  # noqa: BLE001 - 定位失败不影响抽取结果
         logger.warning("字段定位失败（%s）：%s", pdf_path.name, exc)
         return {}
     return locations
+
+
+def read_handling_info(
+    pdf_path: Path, page_map: dict[int, int]
+) -> tuple[str | None, dict[str, Any] | None]:
+    """按版面读取 Handling Information 栏正文。
+
+    模型对这一段经常漏抽（填 null），这里从标签所在文本块里取标签下方的文字，
+    多行拼成一行。返回 (文本, {"page", "bbox"})；bbox 用于判断联系方式是否取自该栏。
+    """
+
+    if not page_map:
+        return None, None
+    try:
+        import pymupdf
+    except ImportError:  # pragma: no cover - 依赖缺失
+        return None, None
+
+    try:
+        with pymupdf.open(pdf_path) as pdf:
+            for global_index, page_no in page_map.items():
+                if page_no < 1 or page_no > pdf.page_count:
+                    continue
+                page = pdf.load_page(page_no - 1)
+                labels = page.search_for("HANDLING INFORMATION")
+                if not labels:
+                    continue
+                label = labels[0]
+                block = _block_containing(page, label)
+                if block is None:
+                    continue
+                # 标签常压在正文中间（AWB 的 Handling Information 栏标题与内容
+                # 垂直重叠），以标签顶为界取本栏内容，同时排除标签自身的词。
+                # 长行会溢出栏位右边线，只限制词的起点，不限制终点。
+                top = label.y0 - 10
+                words = []
+                for word in page.get_text("words"):
+                    if word[1] < top or word[3] > block.y1 + 2:
+                        continue
+                    if not block.x0 - 2 <= word[0] <= block.x1 + 2:
+                        continue
+                    rect = pymupdf.Rect(word[:4])
+                    # 只排除标签自身的短词；正文长行会横跨标签区域，不能整行丢掉
+                    if rect.width <= label.width * 1.5 and rect.intersects(label):
+                        continue
+                    words.append(word)
+                text = _join_words(words)
+                if not text:
+                    continue
+                width = float(page.rect.width)
+                height = float(page.rect.height)
+                return text, {
+                    "page": global_index,
+                    "bbox": _normalize_box(
+                        (block.x0, top, block.x1, block.y1), width, height
+                    ),
+                }
+    except Exception as exc:  # noqa: BLE001 - 兜底失败不影响主流程
+        logger.warning("Handling Information 读取失败（%s）：%s", pdf_path.name, exc)
+    return None, None
+
+
+def read_value_below_label(
+    pdf_path: Path,
+    page_map: dict[int, int],
+    label: str,
+    max_gap: float = 80.0,
+) -> str | None:
+    """读取版式标签正下方（同列、最近一行）的第一个词。
+
+    用于抽取值与版式栏位对不上时按页面纠正（如 Airport of Departure 栏的 LAX）。
+    """
+
+    if not page_map:
+        return None
+    try:
+        import pymupdf
+    except ImportError:  # pragma: no cover - 依赖缺失
+        return None
+
+    try:
+        with pymupdf.open(pdf_path) as pdf:
+            for page_no in page_map.values():
+                if page_no < 1 or page_no > pdf.page_count:
+                    continue
+                page = pdf.load_page(page_no - 1)
+                labels = page.search_for(label)
+                if not labels:
+                    continue
+                anchor = labels[0]
+                rows: dict[int, list[Any]] = {}
+                for word in page.get_text("words"):
+                    if word[3] < anchor.y1 - 1 or word[1] > anchor.y1 + max_gap:
+                        continue
+                    if word[0] < anchor.x0 - 12 or word[0] > anchor.x1 + 40:
+                        continue
+                    rows.setdefault(round(float(word[1]) / 2), []).append(word)
+                if not rows:
+                    continue
+                # 标签下面的续行（"(Addr. of First Carrier)..."）和相邻栏位标签
+                # 都不是值；港口栏只认三字码，逐行找到第一个为止
+                for key in sorted(rows):
+                    ordered = sorted(rows[key], key=lambda item: item[0])
+                    for word in ordered:
+                        text = str(word[4]).strip()
+                        if re.fullmatch(r"[A-Z]{3}", text):
+                            return text
+    except Exception as exc:  # noqa: BLE001 - 兜底失败不影响主流程
+        logger.warning("栏位取值失败（%s / %s）：%s", pdf_path.name, label, exc)
+    return None

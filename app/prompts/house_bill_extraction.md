@@ -9,8 +9,8 @@
 | 键 | 版式栏位 | 抽取要求 |
 |---|---|---|
 | hawb | 右上 HAWB No. | 取 HAWB No. / House Air Waybill No.；去掉空格与连字符两侧空白，统一大写；**不要取主单号（MAWB）** |
-| sfg | Airport of Departure | **原样输出页面上的文本**（如 `SHANGHAI PUDONG INTERNATIONAL APT`、`PVG`），不要自行改写成三字码；后端会统一归一，无法确定时该字段留空并进入待审核 |
-| mdg | Airport of Destination | **原样输出页面上的文本**，不要自行改写或补全三字码；后端统一归一 |
+| sfg | Airport of Departure | **只输出 IATA 三字码**（如 PVG、LAX）；原文写城市名/机场全称时转换成对应三字码（如 `SHANGHAI PUDONG`→PVG、`GUADALAJARA`→GDL）；原文是国家/地区/多机场城市（如 GERMANY、SHANGHAI）确实无法确定具体机场时，value=null、status=`needs_review`，原文写进 `evidence` |
+| mdg | Airport of Destination | **只输出 IATA 三字码**（如 LAX、GDL）；原文写城市名/机场全称时转换成对应三字码；确定不了具体机场时 value=null、status=`needs_review`，原文写进 `evidence` |
 | hbh | Flight No. / Requested Flight 前半段 | 完整航班号，格式为 2 位航司代码 + 数字（如 N8652），去掉空格与连字符；**不要拆出 By First Carrier 的二字码** |
 | hbrq | Requested Flight/Date 后半段 | 航班日期，统一 `YYYY-MM-DD`；年份缺失时依据单据签发日期补全，无法确定填 null |
 | currency | Currency | 币种三字代码（如 CNY、USD、EUR）；只取币种本身，不要取 CHGS 栏的 PPD / COLL / CC 标记 |
@@ -65,7 +65,7 @@
 | rate | Rate/Charge | 只取货物表格**本行** Rate/Charge 列的数字，不带货币符号与千分位；本行该列空白就填 null，**不要**取下方 Weight Charge / Total Prepaid 等费用区金额，也不要按 Total ÷ Chargeable Weight 反算 |
 | ratetotal | Total | 只取货物表格**本行** Total 列的数字，不带货币符号与千分位；空白填 null，不要取下方 Weight Charge / Total Prepaid / Total Collect 的金额 |
 | zdvolume | Nature and Quantity of Goods 中的 DIMS/VOL | 制单体积，立方米数字；只有尺寸（如 DIMS 137x105x170 CM）时按尺寸换算为 M³ |
-| pm | Nature and Quantity of Goods | 品名/货物描述原文（不含尺寸与体积数字），多行合并为一行 |
+| pm | Nature and Quantity of Goods | 品名/货物描述原文：只保留货物名称、型号、规格描述；剔除 `HS CODE`、发票号（`IN.xxx`）、`P.O.`、`DIMS/VOL` 等栏内非品名行；多行品名合并为一行 |
 
 ## 严格规则
 
@@ -76,11 +76,15 @@
 5. 电话只保留号码本身，不要填传真（Fax）除非页面只有 Fax。
 6. 数字字段不要带单位、货币符号、千分位；不要把小计/合计当成本单值。
 7. 制单字段（zdpiece / zdweight / ratelevel / jfweight / rate / ratetotal）只取货物表格中**本单对应行**的值，不要取页脚合计。**Rate/Charge、Total 空栏很常见**（本行只印了件数、毛重、Rate Class、计费重量时）：此时必须填 null——不要用相邻行/相邻栏的数字、下方费用区金额填充，也不要用「Total ÷ Chargeable Weight」或「Chargeable Weight × 单价」反算。
-8. 品名与体积都来自 Nature and Quantity of Goods 栏：`pm` 只放品名，**不要包含 `DIMS ... CM`、`VOL ... M3` 等尺寸/体积文字**；`zdvolume` 只放数值（体积也只输出这一份，不要另出 volume）。
+8. 品名与体积都来自 Nature and Quantity of Goods 栏：`pm` 只放品名，**不要包含 `DIMS ... CM`、`VOL ... M3` 等尺寸/体积文字，也不要包含 `HS CODE: ...`、`IN.xxxx` 发票号、`P.O.` 等栏内附加行**；`zdvolume` 只放数值（体积也只输出这一份，不要另出 volume）。
 9. 同一字段在页面出现多次且值不同（如手写更正）：以最清晰的打印值为准，并在 `warnings` 说明。
 10. 跨页时合并同一份分单的信息；若续页出现另一份分单的单号，只取属于本单的内容。
 11. `confidence` 表示整体抽取可信度（0–1）：字段清晰齐全 ≥0.9；有缺字段 0.7–0.9；大量模糊/缺字段 <0.7。
 12. `warnings` 只写必要的异常说明，每条不超过 30 字，最多 3 条；正常抽取时输出空数组。
+13. **每个非空字段都要在 `evidence` 里给一条原文引用**：`quote` ≤60 字，逐字引用页面文本（可跨行，用空格连接），不要改写、翻译或补全；宁可只引用值本身，也不要编造。
+14. `status` 取 `confirmed`（有明确原文）/ `needs_review`（值不确定或找不到原文）/ `conflict`（同字段出现多个不同值）。冲突时 `fields` 里保留最可信的一个，并在该字段的 `alternatives` 数组列出其它值。
+15. `evidence` 里的 `confidence` 是字段级可信度（0–1），与整体 `confidence` 分开。
+16. 不要为缺失字段编造 `quote`；不确定就不写该字段的 `evidence`，后端会按 `needs_review` 处理。
 
 ## 输出格式
 
@@ -128,7 +132,16 @@
     "zdvolume": "2.45",
     "pm": "TEMPERATURE&HUMIDITY CHAMBER"
   },
+  "evidence": {
+    "hawb": {"quote": "HAWB: EDC2037060", "status": "confirmed", "confidence": 0.96},
+    "sfg": {"quote": "Airport of Departure (Addr. of First Carrier) PVG", "status": "confirmed", "confidence": 0.95},
+    "mdg": {"quote": "Airport of Destination DFW", "status": "confirmed", "confidence": 0.95},
+    "phone_fhr_hawb": {"quote": "Tel: +86 512 5738 2098", "status": "confirmed", "confidence": 0.9},
+    "pm": {"quote": "TEMPERATURE&HUMIDITY CHAMBER", "status": "confirmed", "confidence": 0.92}
+  },
   "confidence": 0.9,
   "warnings": []
 }
 ```
+
+`evidence` 覆盖所有非空字段即可（缺失字段不必输出）；字段级 `status` 按规则 13–16 给出。

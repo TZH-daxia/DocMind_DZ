@@ -1,15 +1,14 @@
-"""本地演示用的假模型（DOCMIND_DZ_MOCK_LLM=true）。
+"""测试替身：固定样例的假模型（不调用真实模型）。
 
-只覆盖本项目的三种调用：页面分类、分单抽取、舱单抽取。返回固定样例：
+覆盖本项目的三种调用：页面分类、分单抽取、舱单抽取。返回固定样例：
 2 份分单 + 3 行舱单（其中 1 份分单重量不一致、1 行舱单只有分单没有分单页），
-用于在没有 API Key 的情况下验证管线、核对逻辑与前端展示。
+用于离线验证管线、核对逻辑与前端展示。
 """
 
 from __future__ import annotations
 
 import json
 import re
-import time
 
 from app.config import Settings
 
@@ -100,7 +99,8 @@ _MOCK_MANIFEST = [
 ]
 
 
-class MockModelGateway:
+class FakeModelGateway:
+    """接口与 ModelGateway 一致的假网关，供测试离线使用。"""
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._house_index = 0
@@ -123,10 +123,13 @@ class MockModelGateway:
         label: str,
         system_prompt: str,
         human_prompt: str,
-        image_paths: list[str],
+        image_paths: list[str] | None = None,
+        *,
+        image_bytes: list[bytes] | None = None,
     ) -> str:
+        # 测试桩：返回空串表示"不覆盖文本层"，避免假 OCR 文本污染分类/抽取
         await _sleep()
-        return "（MOCK 模式）本页为图片/扫描件，未执行真实 OCR 转写。"
+        return ""
 
     def _classify(self, human_prompt: str) -> str:
         page_count = max(1, len(re.findall(r"^PAGE\s+\d+", human_prompt, flags=re.MULTILINE)))
@@ -155,7 +158,6 @@ async def _sleep() -> None:
     import asyncio
 
     await asyncio.sleep(0.05)
-    _ = time.time()
 
 
 def _clone(rows: list[dict]) -> list[dict]:

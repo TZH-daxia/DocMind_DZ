@@ -7,7 +7,13 @@ import pytest
 from app.schemas.file import UploadedDocument
 from app.schemas.submit import SubmitDocument, SubmitRequest
 from app.service.task_service import TaskError, TaskService
-from tests.conftest import MANIFEST_PAGE, MASTER_PAGE, house_page, write_pdf
+from tests.conftest import (
+    MANIFEST_PAGE,
+    MASTER_PAGE,
+    house_page,
+    make_service,
+    write_pdf,
+)
 
 
 async def _run_task(service: TaskService, task_id: str) -> None:
@@ -44,7 +50,7 @@ async def test_submit_requires_acknowledgement_when_inconsistent(settings, tmp_p
         tmp_path / "bundle.pdf",
         [MASTER_PAGE, house_page("HAWB0001"), house_page("HAWB0002"), MANIFEST_PAGE],
     )
-    service = TaskService(settings)
+    service = make_service(settings)
     snapshot = service.create_task(
         UploadedDocument(filename="bundle.pdf", content=pdf.read_bytes())
     )
@@ -77,7 +83,7 @@ async def test_submit_requires_acknowledgement_when_inconsistent(settings, tmp_p
 
 def test_submit_rejects_unfinished_task(settings, tmp_path):
     pdf = write_pdf(tmp_path / "x.pdf", [MASTER_PAGE])
-    service = TaskService(settings)
+    service = make_service(settings)
     snapshot = service.create_task(
         UploadedDocument(filename="x.pdf", content=pdf.read_bytes())
     )

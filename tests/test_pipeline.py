@@ -1,4 +1,4 @@
-"""端到端管线（mock 模型）。"""
+"""端到端管线（注入假网关，不调用真实模型）。"""
 
 import asyncio
 
@@ -6,7 +6,13 @@ import pytest
 
 from app.schemas.file import UploadedDocument
 from app.service.task_service import TaskError, TaskService
-from tests.conftest import MANIFEST_PAGE, MASTER_PAGE, house_page, write_pdf
+from tests.conftest import (
+    MANIFEST_PAGE,
+    MASTER_PAGE,
+    house_page,
+    make_service,
+    write_pdf,
+)
 
 
 async def _run_task(service: TaskService, task_id: str) -> None:
@@ -29,7 +35,7 @@ async def test_pipeline_skips_master_and_compares_manifest(settings, tmp_path):
             MANIFEST_PAGE,
         ],
     )
-    service = TaskService(settings)
+    service = make_service(settings)
     snapshot = service.create_task(
         UploadedDocument(filename="bundle.pdf", content=pdf.read_bytes())
     )
@@ -71,7 +77,7 @@ async def test_pipeline_skips_master_and_compares_manifest(settings, tmp_path):
 
 async def test_pipeline_succeeds_with_master_only_file(settings, tmp_path):
     pdf = write_pdf(tmp_path / "master_only.pdf", [MASTER_PAGE, MANIFEST_PAGE])
-    service = TaskService(settings)
+    service = make_service(settings)
     snapshot = service.create_task(
         UploadedDocument(filename="master_only.pdf", content=pdf.read_bytes())
     )
@@ -89,7 +95,7 @@ async def test_manifest_only_file_succeeds_with_hint(settings, tmp_path):
     """只有舱单时同样跳过抽取，并提示补充分单与主单。"""
 
     pdf = write_pdf(tmp_path / "manifest_only.pdf", [MANIFEST_PAGE])
-    service = TaskService(settings)
+    service = make_service(settings)
     snapshot = service.create_task(
         UploadedDocument(filename="manifest_only.pdf", content=pdf.read_bytes())
     )
@@ -105,7 +111,7 @@ async def test_master_only_file_skips_extract_and_verify_nodes(settings, tmp_pat
     """只有主单时，图应直接跳到结果装配，不执行抽取与核对节点。"""
 
     pdf = write_pdf(tmp_path / "master_single.pdf", [MASTER_PAGE])
-    service = TaskService(settings)
+    service = make_service(settings)
     snapshot = service.create_task(
         UploadedDocument(filename="master_single.pdf", content=pdf.read_bytes())
     )
@@ -135,7 +141,7 @@ async def test_pipeline_accepts_house_pdf_with_manifest_xlsx(settings, tmp_path)
     xlsx = tmp_path / "manifest.xlsx"
     workbook.save(xlsx)
 
-    service = TaskService(settings)
+    service = make_service(settings)
     snapshot = service.create_task(
         [
             UploadedDocument(filename="house.pdf", content=pdf.read_bytes()),
@@ -159,28 +165,28 @@ async def test_pipeline_accepts_house_pdf_with_manifest_xlsx(settings, tmp_path)
 
 
 def test_create_task_rejects_empty_upload_list(settings):
-    service = TaskService(settings)
+    service = make_service(settings)
     with pytest.raises(TaskError) as excinfo:
         service.create_task([])
     assert excinfo.value.code == "FILE_EMPTY"
 
 
 def test_reject_unsupported_extension(settings):
-    service = TaskService(settings)
+    service = make_service(settings)
     with pytest.raises(TaskError) as excinfo:
         service.create_task(UploadedDocument(filename="a.txt", content=b"hello"))
     assert excinfo.value.code == "FILE_TYPE_NOT_SUPPORTED"
 
 
 def test_reject_fake_pdf(settings):
-    service = TaskService(settings)
+    service = make_service(settings)
     with pytest.raises(TaskError) as excinfo:
         service.create_task(UploadedDocument(filename="a.pdf", content=b"not a pdf"))
     assert excinfo.value.code == "FILE_CONTENT_INVALID"
 
 
 def test_reject_too_large(settings):
-    service = TaskService(settings.model_copy(update={"max_file_size_mb": 1}))
+    service = make_service(settings.model_copy(update={"max_file_size_mb": 1}))
     with pytest.raises(TaskError) as excinfo:
         service.create_task(
             UploadedDocument(filename="big.pdf", content=b"%PDF" + b"0" * (2 * 1024 * 1024))

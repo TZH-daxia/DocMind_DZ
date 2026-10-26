@@ -11,7 +11,7 @@ from app.main import create_app
 def _preflight(origin: str) -> str | None:
     client = TestClient(create_app())
     response = client.options(
-        "/dz/analysis/tasks",
+        "/docmind_dz/analysis/tasks",
         headers={"Origin": origin, "Access-Control-Request-Method": "GET"},
     )
     return response.headers.get("access-control-allow-origin")

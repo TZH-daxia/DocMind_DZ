@@ -34,14 +34,21 @@ from app.service.normalizers import (
     normalize_int,
     normalize_number,
     normalize_phone,
-    normalize_port,
     similarity,
     similarity_address,
 )
+from app.service.ports import resolve_port
 
 SIMILAR_TEXT_THRESHOLD = 0.92
 NUMBER_RELATIVE_TOLERANCE = 0.02
 NUMBER_ABSOLUTE_TOLERANCE = 0.01
+
+
+def _normalize_port_value(value: str | None) -> str:
+    """港口归一：优先缓存表三字码，无法确定时保留原文，供相似度比较。"""
+
+    code, raw = resolve_port(value)
+    return code or raw
 
 
 def _is_blank(value: str | None) -> bool:
@@ -121,8 +128,8 @@ def compare_field(
             status, score = "mismatch", 0.0
             note = f"数值不一致：{house_number} ≠ {manifest_number}"
     elif spec.kind == "port":
-        house_port = normalize_port(house_value)
-        manifest_port = normalize_port(manifest_value)
+        house_port = _normalize_port_value(house_value)
+        manifest_port = _normalize_port_value(manifest_value)
         if house_port == manifest_port:
             note = "港口归一化后一致" if house_port else "一致"
         else:
@@ -445,11 +452,11 @@ def compare_totals(
     # 1. 目的港：任意一份分单的目的港与总运单不一致即判失败
     house_port_key = HOUSE_KEY_BY_COMPARE_KEY["dest_port"]
     house_ports = [
-        normalize_port((bill.get("fields") or {}).get(house_port_key))
+        _normalize_port_value((bill.get("fields") or {}).get(house_port_key))
         for bill in house_bills
     ]
     house_ports = [port for port in house_ports if port]
-    master_port = normalize_port(master.dest_port) if master else ""
+    master_port = _normalize_port_value(master.dest_port) if master else ""
     if not master_port:
         checks.append(
             TotalsCheck(

@@ -22,6 +22,7 @@ from app.schemas.submit import SubmitRequest, SubmitResponse
 from app.service.gates import ConcurrencyGates
 from app.service.pipeline import Pipeline, PipelineError
 from app.storage.file_store import FileStore
+from app.storage.task_docs import load_document, load_documents, load_pages_meta
 from app.workflow.errors import TaskCancelledError, TaskPausedError
 
 if TYPE_CHECKING:
@@ -82,7 +83,7 @@ class TaskReporter:
 
 
 class TaskService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, gateway: Any = None) -> None:
         self.settings = settings
         self.store = FileStore(settings)
         self._running: dict[str, asyncio.Task[None]] = {}
@@ -93,6 +94,8 @@ class TaskService:
         self.pipeline: Pipeline | None = None
         self.graph: AnalysisGraph | None = None
         self._gateway_error: str | None = None
+        # 注入网关用于测试（离线跑管线）；生产走真实模型网关
+        self._injected_gateway = gateway
         try:
             self._build_model_layers()
         except ValueError as exc:
@@ -101,7 +104,9 @@ class TaskService:
             logger.warning("模型未配置：%s", exc)
 
     def _build_model_layers(self) -> None:
-        self.gateway = build_gateway(self.settings, gates=self.gates)
+        self.gateway = self._injected_gateway or build_gateway(
+            self.settings, gates=self.gates
+        )
         self.pipeline = Pipeline(self.settings, self.store, self.gateway)
         self.pipeline.gates = self.gates
 
@@ -310,39 +315,25 @@ class TaskService:
             "completed_nodes": self._completed_nodes(task_id),
         }
         # 断点续跑：跳过已完成节点时，state 里没有上游产物，需从磁盘回填
-        pages_doc = self.store.read_json_or_none(self.store.pages_path(task_id)) or {}
-        if pages_doc.get("pages"):
-            state["pages"] = pages_doc["pages"]
-            state["parser"] = pages_doc.get("parser", "")
-            state["page_boundaries"] = pages_doc.get("page_boundaries", [])
-            state["warnings"] = list(pages_doc.get("warnings") or [])
-            if pages_doc.get("files"):
-                state["files"] = pages_doc["files"]
+        doc = load_document(self.store, task_id)
+        if doc.get("pages"):
+            state["pages"] = [page.model_dump() for page in doc["pages"]]
+            state["parser"] = doc.get("parser", "")
+            state["page_boundaries"] = doc.get("page_boundaries", [])
+            state["warnings"] = list(doc.get("warnings") or [])
+            if doc.get("files"):
+                state["files"] = doc["files"]
+            if doc.get("segments"):
+                state["segments"] = doc["segments"]
+                state["master_bills"] = doc.get("master_bills", [])
 
-        segments_doc = self.store.read_json_or_none(self.store.segments_path(task_id)) or {}
-        if segments_doc.get("segments"):
-            state["segments"] = segments_doc["segments"]
-            state["master_bills"] = segments_doc.get("master_bills", [])
+        if self.store.documents_path(task_id).exists():
+            house_bills, manifest, doc_warnings = load_documents(self.store, task_id)
+            state["house_bills"] = house_bills
+            state["manifest"] = manifest
             state["warnings"] = list(
-                dict.fromkeys(
-                    [*state.get("warnings", []), *(segments_doc.get("warnings") or [])]
-                )
+                dict.fromkeys([*state.get("warnings", []), *doc_warnings])
             )
-            if segments_doc.get("pages"):
-                state["pages"] = segments_doc["pages"]
-
-        house_doc = self.store.read_json_or_none(self.store.house_bills_path(task_id)) or {}
-        if house_doc:
-            state["house_bills"] = house_doc.get("house_bills", [])
-            state["warnings"] = list(
-                dict.fromkeys(
-                    [*state.get("warnings", []), *(house_doc.get("warnings") or [])]
-                )
-            )
-
-        manifest_doc = self.store.read_json_or_none(self.store.manifest_path(task_id))
-        if manifest_doc is not None:
-            state["manifest"] = manifest_doc.get("manifest")
 
         comparisons_doc = (
             self.store.read_json_or_none(self.store.comparisons_path(task_id)) or {}
@@ -365,23 +356,37 @@ class TaskService:
         """按磁盘产物推断已完成节点，仅返回连续前缀，避免跳节点。"""
 
         completed: list[str] = []
-        pages = self.store.read_json_or_none(self.store.pages_path(task_id)) or {}
-        if pages.get("pages"):
+        doc = self.store.read_json_or_none(self.store.document_path(task_id)) or {}
+        if doc.get("pages"):
             completed.append("render_document")
-            if pages.get("transcribed"):
+            if doc.get("transcribed"):
                 completed.append("transcribe_pages")
             else:
                 return completed
         else:
             return completed
-        if self.store.segments_path(task_id).exists():
+        segments = doc.get("segments") or []
+        if segments:
             completed.append("classify_pages")
         else:
             return completed
-        if (
-            self.store.house_bills_path(task_id).exists()
-            and self.store.manifest_path(task_id).exists()
-        ):
+        house_indexes = [
+            index
+            for segment in segments
+            if segment.get("kind") == "house_bill"
+            for index in segment.get("page_indexes") or []
+        ]
+        if not house_indexes:
+            # 只有主单/舱单：路由会跳过局部精读、抽取与核对，视为全部完成
+            completed.extend(
+                ["transcribe_house_zoom", "extract_documents", "verify_consistency"]
+            )
+            return completed
+        if self.store.zoom_status_path(task_id).exists():
+            completed.append("transcribe_house_zoom")
+        else:
+            return completed
+        if self.store.documents_path(task_id).exists():
             completed.append("extract_documents")
         else:
             return completed
@@ -564,11 +569,20 @@ class TaskService:
         record = self.store.read_json_or_none(self.store.submission_path(task_id))
         return record if isinstance(record, dict) else None
 
+    def search_ports(self, keyword: str) -> dict[str, Any]:
+        """港口三字码搜索：只查本地 hbinfo.json，不调模型。"""
+
+        from app.service.port_reference import PortReferenceIndex
+
+        index = PortReferenceIndex.load(self.settings.data_root)
+        if index is None:
+            return {"enabled": False, "items": []}
+        return {"enabled": True, "items": index.search(keyword)}
+
     def page_image(self, task_id: str, index: int) -> Path:
         self._read_status(task_id)
-        # 多文件任务的图片在 src01/、src02/ 子目录，以 pages.json 的 image_rel 为准
-        pages = self.store.read_json_or_none(self.store.pages_path(task_id)) or {}
-        for page in pages.get("pages", []):
+        # 多文件任务的图片在 src01/、src02/ 子目录，以 document.json 的 image_rel 为准
+        for page in load_pages_meta(self.store, task_id):
             if page.get("index") != index:
                 continue
             relative = page.get("image_rel")
@@ -738,13 +752,3 @@ class TaskService:
     # ------------------------------------------------------------ 运维
     def cleanup_expired(self) -> int:
         return self.store.cleanup_expired(self.settings.data_retention_hours)
-
-    def stats(self) -> dict[str, Any]:
-        tasks = self.list_tasks()
-        return {
-            "tasks": len(tasks),
-            "running": sum(1 for task in tasks if task.status == "running"),
-            "house_bills": sum(task.house_bill_count for task in tasks),
-            "inconsistent": sum(task.inconsistent_count for task in tasks),
-            "uptime_seconds": round(time.monotonic(), 1),
-        }

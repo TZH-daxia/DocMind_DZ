@@ -17,7 +17,6 @@ def test_startup_banner_lists_addresses_and_paths(tmp_path: Path) -> None:
         app_port=8010,
         log_dir=tmp_path / "logs",
         data_root=tmp_path / "data",
-        mock_llm=False,
     )
 
     banner = format_startup_banner(settings)

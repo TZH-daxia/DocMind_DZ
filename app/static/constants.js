@@ -23,15 +23,6 @@ export const BILL_STATUS = {
   incomplete: { label: "信息不全", className: "review" },
 };
 
-export const FIELD_STATUS = {
-  match: { label: "一致", className: "ready" },
-  similar: { label: "近似", className: "review" },
-  mismatch: { label: "差异", className: "failed" },
-  missing_in_manifest: { label: "舱单无值", className: "review" },
-  missing_in_house_bill: { label: "分单无值", className: "review" },
-  missing_both: { label: "双方无值", className: "idle" },
-};
-
 export const REASON_LABEL = {
   mismatch: "差异",
   missing: "缺失",
@@ -39,17 +30,12 @@ export const REASON_LABEL = {
   low_confidence: "置信度",
 };
 
-export const KIND_LABEL = {
-  master_bill: "主单",
-  house_bill: "分单",
-  manifest: "舱单",
-  other: "其他",
-};
-
 export const NODES = [
   "解析文档",
   "图像转写",
   "识别主单/分单/舱单",
+  // 只对分单页做四象限放大转写；没有分单时图会跳过该节点
+  "分单局部精读",
   "抽取分单与舱单字段",
   "核对分单与舱单",
   "生成结果",
@@ -117,7 +103,6 @@ export const DEFAULT_MANIFEST_FIELDS = [
   ["chargeable_weight", "计费重量", "cargo"],
   ["volume", "体积", "shipment"],
 ].map(([key, label, group]) => ({ key, label, group }));
-export const DEFAULT_FIELDS = DEFAULT_MANIFEST_FIELDS;
 
 // 参与人字段 → 接口字段名：shipper → *_fhr_hawb，consignee → *_shr_hawb
 const PARTY_FIELD_PREFIX = {

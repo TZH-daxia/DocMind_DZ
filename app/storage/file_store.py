@@ -116,17 +116,20 @@ class FileStore:
     def process_log_path(self, task_id: str) -> Path:
         return self.task_dir(task_id) / "process.log"
 
-    def pages_path(self, task_id: str) -> Path:
-        return self.task_dir(task_id) / "pages.json"
+    def document_path(self, task_id: str) -> Path:
+        """页面元数据 + 分段 + 主单登记（转写全文在 transcription/*.md）。"""
 
-    def segments_path(self, task_id: str) -> Path:
-        return self.task_dir(task_id) / "segments.json"
+        return self.task_dir(task_id) / "document.json"
 
-    def house_bills_path(self, task_id: str) -> Path:
-        return self.task_dir(task_id) / "house_bills.json"
+    def documents_path(self, task_id: str) -> Path:
+        """最终抽取结果：分单字段/定位 + 舱单（不含候选）。"""
 
-    def manifest_path(self, task_id: str) -> Path:
-        return self.task_dir(task_id) / "manifest.json"
+        return self.task_dir(task_id) / "documents.json"
+
+    def candidates_path(self, task_id: str) -> Path:
+        """字段候选唯一来源：逐字段 value/status/confidence/evidence。"""
+
+        return self.task_dir(task_id) / "candidates.json"
 
     def comparisons_path(self, task_id: str) -> Path:
         return self.task_dir(task_id) / "comparisons.json"
@@ -134,31 +137,27 @@ class FileStore:
     def page_image_path(self, task_id: str, index: int) -> Path:
         return self.task_dir(task_id) / f"page_{index:03d}.png"
 
+    # ---- VLM 转写产物（可与提取结果逐字段对照） ----
+    def transcription_dir(self, task_id: str) -> Path:
+        directory = self.task_dir(task_id) / "transcription"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def transcription_path(self, task_id: str, index: int, suffix: str = "") -> Path:
+        """整页转写 page_001.md；分单局部精读 page_001_zoom.md。"""
+
+        return self.transcription_dir(task_id) / f"page_{index:03d}{suffix}.md"
+
+    def zoom_status_path(self, task_id: str) -> Path:
+        """分单局部精读的完成记录（含跳过/失败页，避免断点续跑无限重试）。"""
+
+        return self.transcription_dir(task_id) / "zoom.json"
+
     def result_path(self, task_id: str) -> Path:
         return self.root / "results" / f"{task_id}.json"
 
     def submission_path(self, task_id: str) -> Path:
         return self.task_dir(task_id) / "submission.json"
-
-    def list_task_ids(self) -> list[str]:
-        directory = self.root / "tasks"
-        if not directory.exists():
-            return []
-        return [path.name for path in directory.iterdir() if path.is_dir()]
-
-    def delete_task(self, task_id: str) -> bool:
-        if not re.fullmatch(r"[\w.-]+", task_id):
-            return False
-        removed = False
-        directory = self.root / "tasks" / task_id
-        if directory.exists():
-            shutil.rmtree(directory, ignore_errors=True)
-            removed = True
-        result = self.result_path(task_id)
-        if result.exists():
-            result.unlink(missing_ok=True)
-            removed = True
-        return removed
 
     def cleanup_expired(self, retention_hours: float) -> int:
         """删除超过保留期的任务目录与结果文件；retention_hours<=0 表示永久保留。"""

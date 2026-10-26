@@ -83,22 +83,6 @@ HAWB_NO_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:分单号|分运单号)\s*[:：]?\s*([A-Z0-9][A-Z0-9\-]{4,24})", re.IGNORECASE),
 )
 
-FLIGHT_NO_PATTERN = re.compile(
-    r"(?:航班号|FLIGHT\s*(?:NO\.?|NUMBER)?|FLT\.?)\s*[:：]?\s*([A-Z0-9]{2,3}\s?-?\s?\d{1,4}[A-Z]?)",
-    re.IGNORECASE,
-)
-FLIGHT_NO_LOOSE = re.compile(r"(?<![A-Z0-9])([A-Z]{2}\d{3,4})(?![A-Z0-9])")
-
-FLIGHT_DATE_PATTERN = re.compile(
-    r"(?:航班日期|航班日|FLIGHT\s*DATE|DATE\s*OF\s*(?:DEPARTURE|FLIGHT)|DEPARTURE\s*DATE)"
-    r"\s*(?:[:：]|\s)\s*"
-    r"(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}"
-    r"|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}"
-    r"|\d{1,2}\s*[A-Z]{3}\s*\d{2,4}"
-    r"|\d{1,2}\s*月\s*\d{1,2}\s*日?)",
-    re.IGNORECASE,
-)
-
 PARTY_HINT_PATTERN = re.compile(
     r"SHIPPER|CONSIGNEE|发货人|收货人|托运人|收货单位", re.IGNORECASE
 )
@@ -192,21 +176,6 @@ def find_master_no(text: str) -> str | None:
     return f"{best_digits[:3]}-{best_digits[3:]}" if best_digits else None
 
 
-def find_flight_no(text: str) -> str | None:
-    normalized = normalize_for_match(text)
-    match = FLIGHT_NO_PATTERN.search(normalized)
-    if match:
-        return re.sub(r"[\s-]", "", match.group(1)).upper()
-    match = FLIGHT_NO_LOOSE.search(normalized)
-    return match.group(1).upper() if match else None
-
-
-def find_flight_date(text: str) -> str | None:
-    normalized = normalize_for_match(text)
-    match = FLIGHT_DATE_PATTERN.search(normalized)
-    return match.group(1).strip() if match else None
-
-
 def _hit_labels(patterns: tuple[re.Pattern[str], ...], text: str) -> list[str]:
     hits: list[str] = []
     for pattern in patterns:
@@ -297,7 +266,10 @@ def detect_master_bill(text: str) -> MasterBillSignal:
         if occurrences >= 2:
             evidence.append(f"主单号在页面出现 {occurrences} 次")
 
-    if master_hits and auxiliary >= 1:
+    # 只有标题特征 + 辅助字段、没有实际主单号时不能判主单：
+    # 运单条款页（NOTICE CONCERNING CARRIER'S LIMITATION OF LIABILITY）
+    # 同样含 "Air Waybill"、航班/当事人等词，会被误判成主单
+    if master_hits and auxiliary >= 1 and master_no:
         return MasterBillSignal(True, 0.88, master_no, evidence)
     # 主单号重复出现 + 任一单证特征：即使没有 "MAWB" 字样也按主单处理
     if master_no and occurrences >= 2 and auxiliary >= 1:

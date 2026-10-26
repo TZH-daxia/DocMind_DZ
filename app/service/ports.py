@@ -2,71 +2,69 @@
 
 单证上「Airport of Departure / Destination」常写机场全称或城市名；
 能唯一确定港口时归一成三字码，确定不了就留空并把原文带回，交人工确认。
+唯一事实来源是 `data/reference_cache/hbinfo.json`。
 """
 
 from __future__ import annotations
 
-import re
+from pathlib import Path
 
-from app.service.normalizers import PORT_ALIASES, normalize_port
+from app.service.port_reference import PortReferenceIndex
 
-IATA_CODE_RE = re.compile(r"^[A-Z]{3}$")
 PORT_FIELDS: tuple[str, ...] = ("sfg", "mdg")
 
+_INDEX_CACHE: dict[str, PortReferenceIndex | None] = {}
 
-def _substring_code(text: str) -> str | None:
-    """在机场别名表里做包含匹配；只有唯一命中一个机场时才返回代码。"""
 
-    normalized = re.sub(r"[^0-9A-Z\u4e00-\u9fff]", "", text.upper())
-    if not normalized:
+def _get_index() -> PortReferenceIndex | None:
+    """惰性加载 data/reference_cache/hbinfo.json；缺失时港口一律待审核。
+
+    按 data_root 分别缓存，避免测试/多实例之间互相污染。
+    """
+
+    from app.config import Settings
+
+    try:
+        data_root = str(Settings().data_root)
+    except Exception:  # noqa: BLE001 - 配置异常时按无缓存处理
         return None
-    matched: set[str] = set()
-    for code, aliases in PORT_ALIASES.items():
-        for alias in (code, *aliases):
-            key = re.sub(r"[^0-9A-Z\u4e00-\u9fff]", "", alias.upper())
-            # 太短的别名（如三字码本身）只做全等，避免误命中
-            if len(key) < 4:
-                continue
-            if key in normalized:
-                matched.add(code)
-                break
-    return next(iter(matched)) if len(matched) == 1 else None
+    if data_root not in _INDEX_CACHE:
+        _INDEX_CACHE[data_root] = PortReferenceIndex.load(Path(data_root))
+    return _INDEX_CACHE[data_root]
 
 
-def resolve_port(value: str | None) -> tuple[str | None, str]:
+def resolve_port(
+    value: str | None, index: PortReferenceIndex | None = None
+) -> tuple[str | None, str]:
     """返回 (三字码, 无法确定时的原文)。
 
-    - 原文本身就是三字码 → 原样返回；
-    - 别名表能唯一命中（LOS ANGELES → LAX、SHANGHAI PUDONG… → PVG）→ 返回代码；
-    - 只有城市/机场名且无法唯一确定（如 SHANGHAI）→ 返回 (None, 原文)。
+    只查缓存表：
+    - 模型给的三字码在缓存表里存在 → 直接采用；
+    - 城市/机场名唯一命中 → 归一成三字码；
+    - 多义（如 SHANGHAI 对应 PVG/SHA）或表里查不到 → 返回 (None, 原文)。
     """
 
     text = (value or "").strip()
     if not text:
         return None, ""
-    letters = re.sub(r"[^A-Za-z]", "", text).upper()
-    if IATA_CODE_RE.fullmatch(letters):
-        return letters, ""
-    code = normalize_port(text)
-    # normalize_port 会把任意独立的三字母单词当成代码（如 APT），
-    # 只有出现在已知机场表里的代码才可信
-    if IATA_CODE_RE.fullmatch(code) and code in PORT_ALIASES:
-        return code, ""
-    guess = _substring_code(text)
-    if guess:
-        return guess, ""
-    return None, text
+    reference = index if index is not None else _get_index()
+    if reference is None:
+        return None, text
+    code, _ = reference.lookup(text)
+    return (code, "") if code else (None, text)
 
 
 def normalize_port_fields(
     fields: dict[str, str | None],
     keys: tuple[str, ...] = PORT_FIELDS,
+    index: PortReferenceIndex | None = None,
 ) -> dict[str, str]:
     """就地归一港口字段，返回 {字段: 原文}（只包含无法确定三字码的字段）。"""
 
+    reference = index if index is not None else _get_index()
     evidence: dict[str, str] = {}
     for key in keys:
-        code, raw = resolve_port(fields.get(key))
+        code, raw = resolve_port(fields.get(key), index=reference)
         if raw:
             evidence[key] = raw
         fields[key] = code

@@ -275,7 +275,8 @@ function nodeRows() {
       } else {
         status = "started";
       }
-    } else if (failed) {
+    } else if (succeeded || failed) {
+      // 任务已结束却没有事件 = 图里被条件边跳过（如只有主单时的局部精读/抽取/核对）
       status = "skipped";
     }
     let message = last ? last.message : "";
@@ -352,6 +353,7 @@ function compactPayload(result) {
       page_indexes: bill.page_indexes,
       confidence: bill.confidence,
       fields: bill.fields,
+      candidates: bill.candidates || [],
     })),
     manifest: result.manifest
       ? {

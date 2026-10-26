@@ -28,6 +28,16 @@ def _http_error(exc: TaskError) -> HTTPException:
     )
 
 
+@router.get("/ports", summary="港口三字码搜索")
+async def search_ports(
+    keyword: str = "",
+    service: TaskService = Depends(get_task_service),
+) -> dict[str, Any]:
+    """前端港口输入框的搜索下拉：只查本地 hbinfo.json，不调模型。"""
+
+    return service.search_ports(keyword)
+
+
 @router.post("/tasks", summary="上传单证并创建分析任务")
 async def create_task(
     files: list[UploadFile] | None = File(

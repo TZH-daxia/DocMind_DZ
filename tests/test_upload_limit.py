@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 
 from app.schemas.file import UploadedDocument
-from app.service.task_service import TaskError, TaskService
+from app.service.task_service import TaskError
+from tests.conftest import make_service
 
 
 def _upload(name: str) -> UploadedDocument:
@@ -13,7 +14,7 @@ def _upload(name: str) -> UploadedDocument:
 
 
 def test_create_task_rejects_more_than_five_files(settings) -> None:
-    service = TaskService(settings)
+    service = make_service(settings)
     uploads = [_upload(f"doc{index}.pdf") for index in range(6)]
 
     with pytest.raises(TaskError) as excinfo:
@@ -23,7 +24,7 @@ def test_create_task_rejects_more_than_five_files(settings) -> None:
 
 
 def test_create_task_accepts_five_files(settings) -> None:
-    service = TaskService(settings)
+    service = make_service(settings)
     uploads = [_upload(f"doc{index}.pdf") for index in range(5)]
 
     snapshot = service.create_task(uploads)

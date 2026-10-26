@@ -104,8 +104,7 @@ async def lifespan(app: FastAPI):
         logger.warning("服务已启动，但模型尚未配置：%s", service._gateway_error)
     else:
         logger.info(
-            "服务启动完成，模型网关就绪（mock=%s，启动耗时 %.2fs）",
-            settings.mock_llm,
+            "服务启动完成，模型网关就绪（启动耗时 %.2fs）",
             _startup_elapsed(),
         )
     _echo(format_startup_banner(settings))
@@ -178,7 +177,6 @@ def create_app() -> FastAPI:
         return {
             "status": "ok",
             "app": settings.app_name,
-            "mock_llm": settings.mock_llm,
             "model_configured": service.pipeline is not None,
             "api_prefix": settings.api_prefix,
         }
@@ -199,9 +197,12 @@ def create_app() -> FastAPI:
 
         response = await call_next(request)
         path = request.url.path
-        if request.method == "GET" and not path.startswith(settings.api_prefix):
-            if path == "/" or path.endswith((".html", ".js", ".css")):
-                response.headers["Cache-Control"] = "no-store"
+        if (
+            request.method == "GET"
+            and not path.startswith(settings.api_prefix)
+            and (path == "/" or path.endswith((".html", ".js", ".css")))
+        ):
+            response.headers["Cache-Control"] = "no-store"
         return response
 
     if STATIC_DIR.exists():

@@ -33,20 +33,59 @@ def build_review_items(
 
     for bill in house_bills:
         hawb_no = bill.fields.get(HOUSE_KEY_BY_COMPARE_KEY["hawb_no"])
-        # 港口等无法确定标准值的字段：进待审核，并带上原文供人工确认
-        for key, raw in (bill.field_evidence or {}).items():
+        # 港口等无法确定标准值的字段：候选层保留了归一前原文，进待审核
+        for candidate in bill.candidates:
+            if (
+                candidate.field_key in {"sfg", "mdg"}
+                and not candidate.value
+                and candidate.raw_value
+            ):
+                items.append(
+                    ReviewItem(
+                        tab_id=bill.bill_id,
+                        bill_id=bill.bill_id,
+                        hawb_no=hawb_no,
+                        key=candidate.field_key,
+                        label=FIELD_LABELS.get(
+                            candidate.field_key, candidate.field_key
+                        ),
+                        reason="low_confidence",
+                        message="原文未明确港口三字码，请人工确认",
+                        evidence=candidate.raw_value,
+                    )
+                )
+        # 候选层：字段级低置信 / 多值冲突 / 引用对不上 → 待审核（只在有值时提示）
+        for candidate in bill.candidates:
+            if not candidate.value:
+                continue
+            message = ""
+            if candidate.status == "conflict":
+                others = "、".join(candidate.alternatives) or "多个值"
+                message = f"页面存在多个不同值（{others}），请确认"
+            elif candidate.status == "needs_review":
+                message = (
+                    candidate.warnings[0]
+                    if candidate.warnings
+                    else "字段置信度较低或原文引用对不上，请确认"
+                )
+            elif candidate.confidence < confidence_threshold:
+                message = f"字段置信度仅 {candidate.confidence:.0%}，请确认"
+            if not message:
+                continue
+            quote = candidate.evidence[0].quote if candidate.evidence else ""
             items.append(
                 ReviewItem(
                     tab_id=bill.bill_id,
                     bill_id=bill.bill_id,
                     hawb_no=hawb_no,
-                    key=key,
-                    label=FIELD_LABELS.get(key, key),
+                    key=candidate.field_key,
+                    label=FIELD_LABELS.get(candidate.field_key, candidate.field_key),
                     reason="low_confidence",
-                    message="原文未明确港口三字码，请人工确认",
-                    evidence=raw,
+                    message=message,
+                    evidence=quote or "",
                 )
             )
+
         comparison = comparisons_by_bill.get(bill.bill_id)
         if comparison is None:
             items.append(

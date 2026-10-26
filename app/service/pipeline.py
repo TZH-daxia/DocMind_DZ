@@ -12,12 +12,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from app.agent.model_call import ModelCallFailedError
-from app.collector.locator import locate_fields, locate_manifest_fields
+from app.collector.locator import (
+    locate_fields,
+    locate_manifest_fields,
+    read_handling_info,
+    read_value_below_label,
+)
 from app.collector.parsers import ParserError, build_default_registry
 from app.collector.segmenter import (
     PageKind,
@@ -31,6 +37,7 @@ from app.config import Settings
 from app.schemas.documents import (
     AnalysisResult,
     ComparisonSummary,
+    FieldCandidate,
     HouseBill,
     HouseBillComparison,
     ManifestDocument,
@@ -50,10 +57,19 @@ from app.service.extraction import (
     extract_manifest,
     transcribe_page,
 )
+from app.service.extraction import (
+    transcribe_house_zoom as transcribe_house_zoom_page,
+)
 from app.service.gates import ConcurrencyGates
-from app.service.ports import normalize_port_fields
+from app.service.ports import normalize_port_fields, resolve_port
 from app.service.review import build_review_items
 from app.storage.file_store import FileStore
+from app.storage.task_docs import (
+    load_document,
+    load_documents,
+    save_document,
+    save_documents,
+)
 from app.workflow.state import AnalysisState
 
 logger = logging.getLogger(__name__)
@@ -66,22 +82,192 @@ CHARGE_COLUMN_KEYS: tuple[str, ...] = ("rate", "ratetotal")
 # 同行判定：归一化坐标下的纵向容差（约 6pt / 842pt）
 CHARGE_ROW_SLACK = 0.007
 
-# 单证文本层应当出现的关键标签：只有数字、没有这些标签的文本层视为不可用
-DOC_TEXT_LABELS: tuple[str, ...] = (
-    "AIR WAYBILL",
-    "WAYBILL",
-    "HAWB",
-    "MAWB",
-    "SHIPPER",
-    "CONSIGNEE",
-    "MASTER",
-    "HOUSE",
-    "运单",
-    "分单",
-    "主单",
-    "舱单",
-    "MANIFEST",
+# 港口字段 → 版式栏位标签：抽取值与栏位对不上时按标签下方回读
+PORT_LAYOUT_LABELS: tuple[tuple[str, str], ...] = (
+    ("sfg", "AIRPORT OF DEPARTURE"),
+    ("mdg", "AIRPORT OF DESTINATION"),
 )
+# 当事人联系方式：若定位落在 Handling Information 栏，说明取自 Notify/Agent 段
+CONTACT_FIELD_KEYS: tuple[str, ...] = (
+    "phone_fhr_hawb",
+    "email_fhr_hawb",
+    "fax_fhr_hawb",
+    "phone_shr_hawb",
+    "email_shr_hawb",
+    "fax_shr_hawb",
+)
+
+
+def _compact_match_text(text: str) -> str:
+    """把 VLM Markdown 与引用压成可比较的紧凑文本（去标记、空白、大小写）。"""
+
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"[|*#`>]+", " ", text)
+    text = text.replace("\u3000", " ")
+    return re.sub(r"\s+", "", text).lower()
+
+
+def _candidate_page_text(pages: list[PageRecord], page_indexes: list[int]) -> str:
+    """候选校验用的页面文本：局部精读与整页转写都算（抽取时局部优先）。"""
+
+    indexes = set(page_indexes)
+    parts: list[str] = []
+    for page in pages:
+        if page.index not in indexes:
+            continue
+        if page.zoom_text:
+            parts.append(page.zoom_text)
+        parts.append(page.text)
+    return "\n".join(parts)
+
+
+def _candidate_quotes(candidates: list[dict[str, Any]]) -> dict[str, str]:
+    quotes: dict[str, str] = {}
+    for item in candidates:
+        for evidence in item.get("evidence") or []:
+            quote = str(evidence.get("quote") or "").strip()
+            if quote:
+                quotes[str(item.get("field_key"))] = quote
+                break
+    return quotes
+
+
+def _append_candidate_warning(item: dict[str, Any], message: str) -> None:
+    warnings = item.setdefault("warnings", [])
+    if message not in warnings:
+        warnings.append(message)
+
+
+# 港口字段的「原文 → 三字码」是既定归一规则，不算值异常，不进待审核
+NORMALIZED_CANDIDATE_KEYS = frozenset({"sfg", "mdg"})
+
+
+def _align_candidates(
+    candidates: list[dict[str, Any]], fields: dict[str, str | None]
+) -> list[dict[str, Any]]:
+    """候选值与最终字段保持一致；归一化/版面修正造成的差异标待审核。"""
+
+    for item in candidates:
+        key = str(item.get("field_key") or "")
+        original = item.get("value")
+        if original not in (None, "") and not item.get("raw_value"):
+            item["raw_value"] = str(original)
+        final = fields.get(key)
+        item["value"] = final
+        if not final:
+            item["status"] = "missing" if not item.get("raw_value") else "needs_review"
+            continue
+        if item.get("raw_value") and str(item["raw_value"]) != str(final):
+            if key in NORMALIZED_CANDIDATE_KEYS:
+                _append_candidate_warning(item, "港口已归一化为三字码")
+                continue
+            if key == "pm":
+                _append_candidate_warning(
+                    item, "品名已剔除 HS CODE/发票号等非品名内容"
+                )
+                continue
+            if item.get("status") == "confirmed":
+                item["status"] = "needs_review"
+            _append_candidate_warning(item, "值与模型原文不一致（已按版面/规则修正）")
+    return candidates
+
+
+def _quote_probes(quote: str) -> list[str]:
+    """把 quote 拆成可校验的探针：整串、省略号分段、较长 token。
+
+    模型常在 quote 里用 `...` 连接栏位名和值，或把不同栏的文字拼在一起，
+    整串在转写文本里天然不连续；只要一个片段能在转写文本里命中，就认为引用可信。
+    """
+
+    probes: list[str] = []
+    compact = _compact_match_text(quote)
+    if compact:
+        probes.append(compact)
+    for part in re.split(r"\.{2,}|…+|\||<br\s*/?>", quote, flags=re.IGNORECASE):
+        candidate = _compact_match_text(part)
+        if len(candidate) >= 6:
+            probes.append(candidate)
+    for token in re.split(r"[\s,;:()\[\]{}]+", quote):
+        candidate = _compact_match_text(token)
+        if len(candidate) >= 6:
+            probes.append(candidate)
+    return list(dict.fromkeys(sorted(probes, key=len, reverse=True)))
+
+
+def _validate_candidates(
+    pages: list[PageRecord],
+    page_indexes: list[int],
+    candidates: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """校验 evidence.quote 是否真的出现在转写文本里；不通过只降级，不丢值。"""
+
+    # 兼容旧格式/模型漏输出：整单一条 quote 都没有时不逐字段降级，
+    # 否则会把"模型没按新格式给引用"误判成所有字段都不可信
+    quoted = sum(
+        1
+        for item in candidates
+        if any((e.get("quote") or "").strip() for e in item.get("evidence") or [])
+    )
+    if quoted == 0:
+        return candidates, ["模型未返回原文引用，字段级复核不可用"]
+    page_text = _compact_match_text(_candidate_page_text(pages, page_indexes))
+    missing_quotes = 0
+    stale_quotes = 0
+    for item in candidates:
+        if not item.get("value"):
+            continue
+        quote = ""
+        for evidence in item.get("evidence") or []:
+            quote = str(evidence.get("quote") or "").strip()
+            if quote:
+                break
+        if not quote:
+            missing_quotes += 1
+            item["status"] = "needs_review"
+            item.setdefault("warnings", []).append("缺少原文引用")
+            continue
+        if not any(probe in page_text for probe in _quote_probes(quote)):
+            stale_quotes += 1
+            item["status"] = "needs_review"
+            _append_candidate_warning(item, "原文引用未在转写文本中找到")
+    warnings: list[str] = []
+    if stale_quotes:
+        warnings.append(
+            f"{stale_quotes} 个字段的原文引用未在转写文本中找到，已转待审核"
+        )
+    if missing_quotes:
+        warnings.append(f"{missing_quotes} 个字段缺少原文引用，已转待审核")
+    return candidates, warnings
+
+
+def _box_inside(box: dict[str, Any], block: dict[str, Any]) -> bool:
+    """定位框中心是否落在给定区块内（判断值取自哪一栏）。"""
+
+    if box.get("page") != block.get("page"):
+        return False
+    x, y, width, height = box["bbox"]
+    bx, by, bw, bh = block["bbox"]
+    center_x = x + width / 2
+    center_y = y + height / 2
+    return bx <= center_x <= bx + bw and by <= center_y <= by + bh
+
+
+# 品名栏里的非品名附加行：HS CODE、发票号、P.O. 等
+HS_CODE_RE = re.compile(r"\bHS\s*CODE\s*[:：]?\s*[0-9A-Z.\-]+", re.IGNORECASE)
+INVOICE_REF_RE = re.compile(r"\bIN[.。:：]?\s*[0-9]{6,}\b", re.IGNORECASE)
+PO_REF_RE = re.compile(r"\bP\.?\s*O\.?\s*(?:NO\.?|#)?\s*[0-9A-Z\-]+", re.IGNORECASE)
+
+
+def clean_commodity_description(value: str | None) -> tuple[str | None, bool]:
+    """品名栏只保留货名/型号：剔除 HS CODE、发票号、P.O. 等附加行。"""
+
+    if not value:
+        return value, False
+    cleaned = HS_CODE_RE.sub(" ", value)
+    cleaned = INVOICE_REF_RE.sub(" ", cleaned)
+    cleaned = PO_REF_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;|")
+    return (cleaned or None), cleaned != value
 
 
 def _drop_unreliable_charge_fields(
@@ -121,20 +307,6 @@ def _drop_unreliable_charge_fields(
     return warnings
 
 
-def _text_layer_usable(text: str, min_chars: int) -> bool:
-    """文本层是否可用于分类。
-
-    扫描件的文本层常常只有零散数字或表头碎片（字符数够但没有单证标签），
-    这类页面继续用文本层会把分类带偏，应交给视觉模型逐字转写。
-    """
-
-    stripped = text.strip()
-    if len(stripped) < min_chars:
-        return False
-    upper = stripped.upper()
-    return any(label in upper for label in DOC_TEXT_LABELS)
-
-
 class PipelineError(RuntimeError):
     """面向前端的业务错误（code + 中文 message）。"""
 
@@ -156,11 +328,10 @@ class Pipeline:
     # ------------------------------------------------------------------ 1
     async def render_document(self, state: AnalysisState) -> dict[str, Any]:
         task_id = state["task_id"]
-        pages_path = self.store.pages_path(task_id)
-        cached = self.store.read_json_or_none(pages_path)
-        if cached and cached.get("pages"):
+        cached = load_document(self.store, task_id)
+        if cached.get("pages"):
             return {
-                "pages": cached["pages"],
+                "pages": [page.model_dump() for page in cached["pages"]],
                 "parser": cached.get("parser", ""),
                 "warnings": cached.get("warnings", []),
                 "page_boundaries": cached.get("page_boundaries", []),
@@ -221,7 +392,9 @@ class Pipeline:
                         if page.image_path
                         else None,
                         char_count=len(page.text),
-                        source_file=item["name"],
+                        # 用落盘文件名（safe_filename 净化后），否则含空格/特殊字符的
+                        # 原名与磁盘文件不一致，定位原图时会找不到 PDF
+                        source_file=source.name,
                         page_in_file=page.index,
                     )
                 )
@@ -259,33 +432,24 @@ class Pipeline:
     async def transcribe_pages(self, state: AnalysisState) -> dict[str, Any]:
         task_id = state["task_id"]
         pages = [PageRecord(**item) for item in state.get("pages") or []]
-        pages_path = self.store.pages_path(task_id)
-        cached = self.store.read_json_or_none(pages_path) or {}
+        cached = load_document(self.store, task_id)
         if cached.get("transcribed"):
             return {
-                "pages": cached.get("pages", []),
+                "pages": [page.model_dump() for page in cached.get("pages") or []],
                 "warnings": cached.get("warnings", []),
                 "page_boundaries": cached.get("page_boundaries", []),
                 "files": cached.get("files", []),
             }
 
-        targets = [
-            page
-            for page in pages
-            if page.image_rel
-            and (
-                self.settings.force_vlm
-                or not _text_layer_usable(
-                    page.text, self.settings.text_layer_min_chars
-                )
-            )
-        ]
+        # 所有页面都走视觉转写：不信任文本层（扫描件、字体乱码、表格错位），
+        # 文本层只保留给「字段坐标定位」使用
+        targets = [page for page in pages if page.image_rel]
         warnings: list[str] = []
         if targets:
             await self._emit(
                 state,
                 "图像转写",
-                f"{len(targets)} 页文本层不足，调用视觉模型逐字转写",
+                f"统一调用视觉模型逐字转写 {len(targets)} 页",
                 28,
             )
 
@@ -323,10 +487,11 @@ class Pipeline:
             page_boundaries=cached.get("page_boundaries", []),
             files=cached.get("files", []),
         )
+        vlm_pages = sum(1 for page in targets if page.text_source == "vlm")
         await self._emit(
             state,
             "图像转写",
-            f"文本准备完成，共 {len(pages)} 页",
+            f"视觉转写完成：{vlm_pages}/{len(pages)} 页",
             42,
             "warning" if empty_pages else "info",
         )
@@ -337,17 +502,159 @@ class Pipeline:
             "files": cached.get("files", []),
         }
 
+    # ------------------------------------------------------------------ 2b
+    async def transcribe_house_zoom(self, state: AnalysisState) -> dict[str, Any]:
+        """分单页四象限局部精读：分类后只对 house_bill 页做小字特写转写。
+
+        整页转写保留在 page.text，局部精读写入 page.zoom_text，抽取时局部优先。
+        转写 md 与切图都落盘，便于人工对照「转写 vs 提取」；
+        完成记录写在 transcription/zoom.json，断点续跑不会无限重试。
+        """
+
+        task_id = state["task_id"]
+        pages = [PageRecord(**item) for item in state.get("pages") or []]
+        segments = [Segment(**item) for item in state.get("segments") or []]
+        house_indexes = sorted(
+            {
+                index
+                for segment in segments
+                if segment.kind == "house_bill"
+                for index in segment.page_indexes
+            }
+        )
+        if not house_indexes:
+            return {}
+
+        by_index = {page.index: page for page in pages}
+        status_path = self.store.zoom_status_path(task_id)
+        done = (self.store.read_json_or_none(status_path) or {}).get("pages") or {}
+        pending = [
+            by_index[index]
+            for index in house_indexes
+            if index in by_index and str(index) not in done
+        ]
+        if not pending:
+            return {}
+
+        await self._emit(
+            state,
+            "分单局部精读",
+            f"对 {len(pending)} 页分单做四象限放大转写",
+            49,
+        )
+        warnings: list[str] = []
+        semaphore = asyncio.Semaphore(self.settings.vision_page_concurrency)
+        records: dict[str, dict[str, Any]] = dict(done)
+
+        async def zoom(page: PageRecord) -> None:
+            async with semaphore:
+                try:
+                    images = await asyncio.to_thread(
+                        self._render_part_images, task_id, pages, page
+                    )
+                except Exception as exc:  # noqa: BLE001 - 单页切图失败不阻断
+                    warnings.append(f"第 {page.index} 页局部切图失败：{exc}")
+                    records[str(page.index)] = {"status": "failed"}
+                    return
+                if len(images) < 4:
+                    # 图片直传等没有源 PDF 的场景没有可切的原图，跳过并记录
+                    records[str(page.index)] = {"status": "skipped"}
+                    return
+                try:
+                    text = await transcribe_house_zoom_page(
+                        self.gateway, page, images
+                    )
+                except Exception as exc:  # noqa: BLE001 - 单页失败不阻断
+                    warnings.append(f"第 {page.index} 页局部精读失败：{exc}")
+                    records[str(page.index)] = {"status": "failed"}
+                    return
+                if not (text or "").strip():
+                    records[str(page.index)] = {"status": "empty"}
+                    return
+                page.zoom_text = text.strip()
+                target = self.store.transcription_path(task_id, page.index, "_zoom")
+                self.store.write_text_atomic(target, page.zoom_text)
+                page.zoom_rel = self.store.relative_path(target)
+                records[str(page.index)] = {
+                    "status": "done",
+                    "rel": page.zoom_rel,
+                }
+
+        await asyncio.gather(*(zoom(page) for page in pending))
+        self.store.write_json_atomic(status_path, {"pages": records})
+        merged_warnings = [*(state.get("warnings") or []), *warnings]
+        self._save_pages(
+            task_id,
+            pages,
+            state.get("parser", ""),
+            merged_warnings,
+            transcribed=True,
+            page_boundaries=state.get("page_boundaries") or [],
+            files=state.get("files") or [],
+        )
+        done_count = sum(
+            1 for item in records.values() if item.get("status") == "done"
+        )
+        await self._emit(
+            state,
+            "分单局部精读",
+            f"局部精读完成：{done_count}/{len(house_indexes)} 页",
+            50,
+            "warning" if warnings else "info",
+        )
+        return {
+            "pages": [page.model_dump() for page in pages],
+            "warnings": merged_warnings,
+        }
+
+    def _render_part_images(
+        self, task_id: str, pages: list[PageRecord], page: PageRecord
+    ) -> list[bytes]:
+        """把一页按左上/右上/左下/右下切成四块（12% 重叠，300dpi）。
+
+        只在内存里返回 PNG 字节：局部切图是喂给 VLM 的中间产物，
+        不需要落盘到任务目录，避免 data 层再堆一批临时图片。
+        """
+
+        pdf_path, page_map = self._source_context(task_id, pages, [page.index])
+        if pdf_path is None or page.index not in page_map:
+            return []
+        import pymupdf
+
+        with pymupdf.open(pdf_path) as pdf:
+            page_no = page_map[page.index]
+            if page_no < 1 or page_no > pdf.page_count:
+                return []
+            doc_page = pdf.load_page(page_no - 1)
+            width = float(doc_page.rect.width)
+            height = float(doc_page.rect.height)
+            mid_x, mid_y = width / 2, height / 2
+            overlap_x, overlap_y = width * 0.12, height * 0.12
+            boxes = (
+                (0.0, 0.0, mid_x + overlap_x, mid_y + overlap_y),
+                (mid_x - overlap_x, 0.0, width, mid_y + overlap_y),
+                (0.0, mid_y - overlap_y, mid_x + overlap_x, height),
+                (mid_x - overlap_x, mid_y - overlap_y, width, height),
+            )
+            parts: list[bytes] = []
+            for box in boxes:
+                pixmap = doc_page.get_pixmap(clip=pymupdf.Rect(*box), dpi=300)
+                parts.append(pixmap.tobytes("png"))
+            return parts
+
     # ------------------------------------------------------------------ 3
     async def classify_pages(self, state: AnalysisState) -> dict[str, Any]:
         task_id = state["task_id"]
-        segments_path = self.store.segments_path(task_id)
-        cached = self.store.read_json_or_none(segments_path)
-        if cached:
+        cached = load_document(self.store, task_id)
+        if cached.get("segments"):
+            cached_pages = [
+                page.model_dump() for page in cached.get("pages") or []
+            ]
             return {
                 "segments": cached.get("segments", []),
                 "master_bills": cached.get("master_bills", []),
                 "warnings": cached.get("warnings", []),
-                "pages": cached.get("pages", state.get("pages", [])),
+                "pages": cached_pages or state.get("pages", []),
             }
 
         pages = [PageRecord(**item) for item in state.get("pages") or []]
@@ -503,15 +810,14 @@ class Pipeline:
     # ------------------------------------------------------------------ 4
     async def extract_documents(self, state: AnalysisState) -> dict[str, Any]:
         task_id = state["task_id"]
-        house_path = self.store.house_bills_path(task_id)
-        manifest_path = self.store.manifest_path(task_id)
-        cached_house = self.store.read_json_or_none(house_path)
-        cached_manifest = self.store.read_json_or_none(manifest_path)
-        if cached_house is not None and cached_manifest is not None:
+        if self.store.documents_path(task_id).exists():
+            house_bills, manifest, cached_warnings = load_documents(
+                self.store, task_id
+            )
             return {
-                "house_bills": cached_house.get("house_bills", []),
-                "manifest": cached_manifest.get("manifest"),
-                "warnings": [*state.get("warnings", []), *cached_house.get("warnings", [])],
+                "house_bills": house_bills,
+                "manifest": manifest,
+                "warnings": [*state.get("warnings", []), *cached_warnings],
             }
 
         pages = [PageRecord(**item) for item in state.get("pages") or []]
@@ -547,10 +853,20 @@ class Pipeline:
                         for key in ("sfg", "mdg")
                         if fields.get(key)
                     }
-                    # 港口只接受三字码：确定不了就留空，原文留给待审核
-                    field_evidence = normalize_port_fields(fields)
+                    # 港口只接受三字码：确定不了就留空，原文由候选的 raw_value 保留
+                    normalize_port_fields(fields)
                     bill_warnings = result["warnings"]
                     confidence = result["confidence"]
+                    candidates = result.get("candidates") or []
+                    # 品名栏常把 HS CODE/发票号一起带出来，这里确定性剔除
+                    pm_cleaned, pm_changed = clean_commodity_description(
+                        fields.get("pm")
+                    )
+                    if pm_changed:
+                        fields["pm"] = pm_cleaned
+                        bill_warnings.append(
+                            "品名栏剔除了 HS CODE/发票号等非品名内容"
+                        )
                 except (ModelCallFailedError, ExtractionError) as exc:
                     return HouseBill(
                         bill_id=f"bill_{index:03d}",
@@ -562,22 +878,53 @@ class Pipeline:
                     )
                 finally:
                     finished += 1
+                # 候选值与最终字段对齐（港口归一化后可能被清空，原文留在 raw_value）
+                candidates = _align_candidates(candidates, fields)
+                # quote 必须能在转写文本里找到；找不到只降级为待审核，不丢值
+                candidates, quote_warnings = _validate_candidates(
+                    pages, segment.page_indexes, candidates
+                )
+                bill_warnings = [*bill_warnings, *quote_warnings]
                 field_locations = self._locate_segment_fields(
-                    task_id, pages, segment.page_indexes, fields, field_sources
+                    task_id,
+                    pages,
+                    segment.page_indexes,
+                    fields,
+                    field_sources,
+                    _candidate_quotes(candidates),
                 )
                 # 计价列靠版面位置兜底：空栏时模型容易把别处的数字填进来
                 bill_warnings = [
                     *bill_warnings,
                     *_drop_unreliable_charge_fields(fields, field_locations),
                 ]
+                # 港口抽错（如把运单号前缀当始发港）时按版式栏位回读纠正
+                bill_warnings.extend(
+                    self._fix_ports_by_layout(
+                        task_id,
+                        pages,
+                        segment.page_indexes,
+                        fields,
+                        field_sources,
+                        field_locations,
+                    )
+                )
+                # Handling Information 漏抽时按版面补全；联系方式取自该栏则清空
+                bill_warnings.extend(
+                    self._apply_handling_info(
+                        task_id, pages, segment.page_indexes, fields, field_locations
+                    )
+                )
+                # 港口/联系方式修正后再同步一次候选值
+                candidates = _align_candidates(candidates, fields)
                 return HouseBill(
                     bill_id=f"bill_{index:03d}",
                     segment_id=segment.segment_id,
                     page_indexes=segment.page_indexes,
                     fields=fields,
                     field_locations=field_locations,
-                    field_evidence=field_evidence,
                     field_sources=field_sources,
+                    candidates=[FieldCandidate(**item) for item in candidates],
                     confidence=confidence,
                     warnings=bill_warnings,
                     source_excerpt=self._excerpt(pages, segment.page_indexes),
@@ -647,10 +994,8 @@ class Pipeline:
         manifest_payload = (
             manifest_document.model_dump() if manifest_document is not None else None
         )
-        self.store.write_json_atomic(
-            house_path, {"house_bills": house_payload, "warnings": warnings}
-        )
-        self.store.write_json_atomic(manifest_path, {"manifest": manifest_payload})
+        # 分单/舱单写 documents.json，候选写 candidates.json（同一事实只存一份）
+        save_documents(self.store, task_id, house_bills, manifest_document, warnings)
         await self._emit(
             state,
             "抽取分单与舱单字段",
@@ -754,9 +1099,11 @@ class Pipeline:
             review_items=review_items,
             warnings=_unique(state.get("warnings") or []),
         )
-        self.store.write_json_atomic(
-            self.store.result_path(task_id), result.model_dump(mode="json")
-        )
+        payload = result.model_dump(mode="json")
+        # 候选只在 candidates.json 存一份；results 是交付物，不再内嵌候选
+        for bill in payload.get("house_bills") or []:
+            bill.pop("candidates", None)
+        self.store.write_json_atomic(self.store.result_path(task_id), payload)
         await self._emit(
             state,
             "生成结果",
@@ -764,7 +1111,7 @@ class Pipeline:
             f"{result.summary.inconsistent} 份存在字段差异",
             100,
         )
-        return {"result": result.model_dump(mode="json")}
+        return {"result": payload}
 
     # ------------------------------------------------------------------ 工具
     async def _emit(
@@ -795,16 +1142,15 @@ class Pipeline:
         page_boundaries: list[int] | None = None,
         files: list[dict[str, Any]] | None = None,
     ) -> None:
-        self.store.write_json_atomic(
-            self.store.pages_path(task_id),
-            {
-                "parser": parser,
-                "warnings": warnings,
-                "transcribed": transcribed,
-                "page_boundaries": page_boundaries or [],
-                "files": files or [],
-                "pages": [page.model_dump() for page in pages],
-            },
+        save_document(
+            self.store,
+            task_id,
+            pages,
+            parser,
+            warnings,
+            transcribed=transcribed,
+            page_boundaries=page_boundaries,
+            files=files,
         )
 
     def _save_segments(
@@ -815,14 +1161,21 @@ class Pipeline:
         warnings: list[str],
         pages: list[PageRecord],
     ) -> None:
-        self.store.write_json_atomic(
-            self.store.segments_path(task_id),
-            {
-                "segments": [item.model_dump() for item in segments],
-                "master_bills": [item.model_dump() for item in master_bills],
-                "warnings": warnings,
-                "pages": [page.model_dump() for page in pages],
-            },
+        # 分类结果写回同一个 document.json；warnings 与已有值合并，不覆盖前序节点
+        existing = (
+            self.store.read_json_or_none(self.store.document_path(task_id)) or {}
+        )
+        merged = list(
+            dict.fromkeys([*(existing.get("warnings") or []), *warnings])
+        )
+        save_document(
+            self.store,
+            task_id,
+            pages,
+            warnings=merged,
+            transcribed=True,
+            segments=[item.model_dump() for item in segments],
+            master_bills=[item.model_dump() for item in master_bills],
         )
 
     def _resolve_source_pdf(self, task_id: str, source_file: str | None) -> Path | None:
@@ -842,6 +1195,26 @@ class Pipeline:
                 return converted
         return None
 
+    def _source_context(
+        self, task_id: str, pages: list[PageRecord], page_indexes: list[int]
+    ) -> tuple[Path | None, dict[int, int]]:
+        """分单对应的源 PDF 与「全局页 index → PDF 页号」映射。"""
+
+        by_index = {page.index: page for page in pages}
+        first = by_index.get(page_indexes[0]) if page_indexes else None
+        if first is None:
+            return None, {}
+        pdf_path = self._resolve_source_pdf(task_id, first.source_file)
+        if pdf_path is None:
+            return None, {}
+        page_map: dict[int, int] = {}
+        for index in page_indexes:
+            page = by_index.get(index)
+            if page is None or page.source_file != first.source_file:
+                continue
+            page_map[index] = page.page_in_file or index
+        return pdf_path, page_map
+
     def _locate_segment_fields(
         self,
         task_id: str,
@@ -849,28 +1222,87 @@ class Pipeline:
         page_indexes: list[int],
         fields: dict[str, str | None],
         sources: dict[str, str] | None = None,
+        quotes: dict[str, str] | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
-        """在分单所在 PDF 中定位字段值，供前端点击字段时高亮。"""
+        """在分单所在 PDF 中定位字段值，供前端点击字段时高亮。
 
-        by_index = {page.index: page for page in pages}
-        first = by_index.get(page_indexes[0]) if page_indexes else None
-        if first is None:
-            return {}
-        pdf_path = self._resolve_source_pdf(task_id, first.source_file)
+        quotes 来自候选层的 evidence：整条引用先在页面上找锚点，值定位时优先在锚点附近取值，
+        值定位失败退化为引用位置。比只用版式标签更能区分同名值的不同栏位。
+        """
+
+        pdf_path, page_map = self._source_context(task_id, pages, page_indexes)
         if pdf_path is None:
             return {}
-        page_map: dict[int, int] = {}
-        for index in page_indexes:
-            page = by_index.get(index)
-            if page is None or page.source_file != first.source_file:
-                continue
-            page_map[index] = page.page_in_file or index
         # 定位优先用页面原文（港口归一成三字码后，原文才是页面上真实存在的内容）
         lookup = {
             key: (sources or {}).get(key) or value
             for key, value in fields.items()
         }
-        return locate_fields(pdf_path, page_map, lookup)
+        return locate_fields(pdf_path, page_map, lookup, quotes=quotes)
+
+    def _fix_ports_by_layout(
+        self,
+        task_id: str,
+        pages: list[PageRecord],
+        page_indexes: list[int],
+        fields: dict[str, str | None],
+        sources: dict[str, str],
+        locations: dict[str, list[dict[str, Any]]],
+    ) -> list[str]:
+        """港口定位不到时按版式栏位回读纠正（如把运单号前缀 TSN 当成始发港）。"""
+
+        pending = [
+            (key, label) for key, label in PORT_LAYOUT_LABELS if not locations.get(key)
+        ]
+        if not pending:
+            return []
+        pdf_path, page_map = self._source_context(task_id, pages, page_indexes)
+        if pdf_path is None:
+            return []
+        warnings: list[str] = []
+        for key, label in pending:
+            raw = read_value_below_label(pdf_path, page_map, label)
+            code, _ = resolve_port(raw)
+            if not code or code == fields.get(key):
+                continue
+            fields[key] = code
+            sources[key] = raw or code
+            locations.update(
+                locate_fields(pdf_path, page_map, {key: sources[key]})
+            )
+            warnings.append(f"{FIELD_LABELS.get(key, key)}按版面纠正为 {code}")
+        return warnings
+
+    def _apply_handling_info(
+        self,
+        task_id: str,
+        pages: list[PageRecord],
+        page_indexes: list[int],
+        fields: dict[str, str | None],
+        locations: dict[str, list[dict[str, Any]]],
+    ) -> list[str]:
+        """Handling Information 漏抽时按版面补全；联系方式若取自该栏则清空。"""
+
+        pdf_path, page_map = self._source_context(task_id, pages, page_indexes)
+        if pdf_path is None:
+            return []
+        text, block = read_handling_info(pdf_path, page_map)
+        warnings: list[str] = []
+        if text and not str(fields.get("handlinginfo") or "").strip():
+            fields["handlinginfo"] = text
+            warnings.append("Handling Information 按版面补全")
+        if block is None:
+            return warnings
+        for key in CONTACT_FIELD_KEYS:
+            boxes = locations.get(key) or []
+            if not boxes or not _box_inside(boxes[0], block):
+                continue
+            fields[key] = None
+            locations.pop(key, None)
+            warnings.append(
+                f"{FIELD_LABELS.get(key, key)}位于 Handling Information 栏，已清空"
+            )
+        return warnings
 
     def _locate_manifest_fields(
         self,

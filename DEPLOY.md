@@ -8,7 +8,7 @@
 
 ```
 浏览器 / 业务系统（服务端或官网）
-   │  https://ai.wecanintl.com:8444/dz/analysis/**
+   │  https://ai.wecanintl.com:8444/docmind_dz/analysis/**
    ▼
 docmind-dz-gateway  (nginx:alpine)     ← 本项目自带，占用宿主 8444
    │  http://docmind-dz:8010  （compose 内部网络，容器名互访）
@@ -24,11 +24,11 @@ docmind-dz  (FastAPI + LibreOffice)    ← 数据落宿主 ./data 与 ./logs
 |---|---|
 | 项目目录 | `/data/apps/DocMind_DZ` |
 | 对外地址 | `https://ai.wecanintl.com:8444` |
-| 接口基址 | `https://ai.wecanintl.com:8444/dz` |
+| 接口基址 | `https://ai.wecanintl.com:8444/docmind_dz` |
 | 宿主端口 | `8444`（HTTPS 对外）、`8010`（仅绑回环，调试用） |
 | 容器 | `docmind-dz`（应用）、`docmind-dz-gateway`（入口 nginx） |
 | 证书 | 只读复用泛域名证书，不新签、续期自动生效 |
-| 公网暴露面 | **仅 `/dz/**` 接口与 `/health`**；内置前端全体 404 |
+| 公网暴露面 | **仅 `/docmind_dz/**` 接口与 `/health`**；内置前端全体 404 |
 
 **为什么用 8444 而不是 443**：宿主 80 / 443 已被同机其它站点占用，8443 归 DocMind。
 DocMind DZ 自带入口容器并换用备用端口，从而完全不依赖、也不改动其它项目的配置。
@@ -38,7 +38,7 @@ DocMind DZ 自带入口容器并换用备用端口，从而完全不依赖、也
 
 | 项 | DocMind | DocMind DZ | 部署侧处理 |
 |---|---|---|---|
-| 接口前缀 | `/docmind` | `/dz` | nginx `location` 与接口基址跟着改 |
+| 接口前缀 | `/docmind` | `/docmind_dz` | nginx `location` 与接口基址跟着改 |
 | 应用端口 | 8000 | 8010 | Dockerfile / compose / healthcheck 全部改 |
 | 环境变量前缀 | `DOCMIND_` | `DOCMIND_DZ_` | Dockerfile `ENV` 全部改名 |
 | 日志配置 | `DOCMIND_SYSTEM_LOG_FILE`（文件路径） | `DOCMIND_DZ_LOG_DIR`（**目录**） | 容器内 `/app/logs`，文件名固定 `app.log` |
@@ -167,7 +167,7 @@ DocMind DZ 已启动
   （实时查看日志：tail -f /app/logs/app.log）
 ```
 
-> 横幅里的地址是**容器内视角**，公网入口是 `:8444/dz`，别照着横幅去访问。
+> 横幅里的地址是**容器内视角**，公网入口是 `:8444/docmind_dz`，别照着横幅去访问。
 > 「局域网访问」那行是容器在 compose 网络里的内部 IP（`172.x`），宿主机与公网都
 > 访问不到，忽略即可；它只在直接跑在宿主上时才有意义。
 
@@ -178,11 +178,11 @@ DocMind DZ 已启动
 
 ```bash
 curl -sk https://127.0.0.1:8444/health
-# 期望：{"status":"ok","app":"DocMind DZ","mock_llm":false,"model_configured":true,"api_prefix":"/dz"}
+# 期望：{"status":"ok","app":"DocMind DZ","model_configured":true,"api_prefix":"/docmind_dz"}
 # model_configured 为 false 表示模型 Key 没配好，任务一定失败（容器本身不会崩）
 
-curl -sk https://127.0.0.1:8444/dz/analysis/fields | head -c 120   # 字段目录
-curl -sk https://127.0.0.1:8444/dz/analysis/tasks  | head -c 120   # 任务列表
+curl -sk https://127.0.0.1:8444/docmind_dz/analysis/fields | head -c 120   # 字段目录
+curl -sk https://127.0.0.1:8444/docmind_dz/analysis/tasks  | head -c 120   # 任务列表
 
 # 确认该封的都封了
 curl -skI https://127.0.0.1:8444/ | head -1                       # 期望 404（内置前端）
@@ -208,7 +208,7 @@ curl -skI https://127.0.0.1:8444/openapi.json | head -1           # 期望 404
 
 ```bash
 curl -s  https://ai.wecanintl.com:8444/health
-curl -s  https://ai.wecanintl.com:8444/dz/analysis/fields | head -c 120
+curl -s  https://ai.wecanintl.com:8444/docmind_dz/analysis/fields | head -c 120
 curl -sI https://ai.wecanintl.com:8444/ | head -1                 # 404
 ```
 
@@ -240,7 +240,7 @@ ssh -L 8010:127.0.0.1:8010 root@<服务器IP>
 
 ## 四、对外接口
 
-接口基址：`https://ai.wecanintl.com:8444/dz`
+接口基址：`https://ai.wecanintl.com:8444/docmind_dz`
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -291,7 +291,7 @@ DOCMIND_DZ_OFFICE_CONCURRENCY=1      # soffice 单实例，必须串行
 | 应用日志 | `docker compose exec docmind-dz tail -f /app/logs/app.log`（容器 stdout 只有启动横幅与少量告警） |
 | 日志轮转 | 按天轮转成 `logs/app.log.YYYY-MM-DD`，保留 14 天（`DOCMIND_DZ_LOG_RETENTION_DAYS`） |
 | 网关日志 | `docker compose logs docmind-dz-gateway` |
-| 改 nginx 配置 | 改 `deploy/nginx/dz.conf`，然后 `docker exec docmind-dz-gateway nginx -t && docker exec docmind-dz-gateway nginx -s reload` |
+| 改 nginx 配置 | 改 `deploy/nginx/docmind_dz.conf`，然后 `docker exec docmind-dz-gateway nginx -t && docker exec docmind-dz-gateway nginx -s reload` |
 | 升级 | `git pull && docker compose up -d --build`，**挑没人跑任务时**——重启会把在途任务标记为中断 |
 | 副本数 | **只跑一个副本、一个 uvicorn worker**，多开会互相把对方任务误判为中断 |
 | 数据位置 | `./data/tasks/<task_id>/`（原件、页面图、任务日志）、`./data/results/`；默认保留 168 小时自动清理 |
@@ -337,7 +337,7 @@ DOCMIND_DZ_OFFICE_CONCURRENCY=1      # soffice 单实例，必须串行
 |---|---|
 | `Dockerfile` | 镜像构建：非 root（uid 10001）、内置 LibreOffice 与中文字体 |
 | `docker-compose.yml` | 两个服务：`docmind-dz`（应用）+ `gateway`（入口 nginx）；数据/日志绑定挂载 |
-| `deploy/nginx/dz.conf` | 入口配置（完整 server 块，容器内监听 443） |
+| `deploy/nginx/docmind_dz.conf` | 入口配置（完整 server 块，容器内监听 443） |
 | `deploy/fontconfig/cjk-alias.conf` | Windows 中文字体名 → 镜像内开源字体别名（保证分页与开发机一致） |
 | `.env.example` | 环境变量模板 |
 | `.dockerignore` | 构建上下文排除项（`data` / `logs` / `.env` 不进镜像） |
@@ -346,7 +346,7 @@ DOCMIND_DZ_OFFICE_CONCURRENCY=1      # soffice 单实例，必须串行
 ### 可选加固
 
 接口无鉴权，若调用方 IP 固定，最省事的是在安全组里只放行该 IP。若要给整套接口加一层
-口令，可在 `deploy/nginx/dz.conf` 的 `location /dz/` 里加：
+口令，可在 `deploy/nginx/docmind_dz.conf` 的 `location /docmind_dz/` 里加：
 
 ```nginx
 auth_basic           "DocMind DZ";

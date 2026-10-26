@@ -8,24 +8,7 @@ from app.service.normalizers import (
     normalize_flight_no,
     normalize_number,
     normalize_phone,
-    normalize_port,
 )
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("PVG", "PVG"),
-        ("pvg", "PVG"),
-        ("上海浦东国际机场", "PVG"),
-        ("Shanghai Pudong (PVG)", "PVG"),
-        ("Los Angeles", "LAX"),
-        ("LAX ", "LAX"),
-        ("SZX", "SZX"),
-    ],
-)
-def test_normalize_port(raw, expected):
-    assert normalize_port(raw) == expected
 
 
 @pytest.mark.parametrize(

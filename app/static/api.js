@@ -1,5 +1,5 @@
-// 后端接口封装。BASE 与后端 api_prefix 保持一致（默认 /dz）。
-const BASE = "/dz/analysis";
+// 后端接口封装。BASE 与后端 api_prefix 保持一致（默认 /docmind_dz）。
+const BASE = "/docmind_dz/analysis";
 
 async function request(path, options = {}) {
   const response = await fetch(`${BASE}${path}`, options);
@@ -31,6 +31,9 @@ export const api = {
   getResult: (taskId) => request(`/tasks/${encodeURIComponent(taskId)}/result`),
 
   getFields: () => request("/fields"),
+
+  searchPorts: (keyword) =>
+    request(`/ports?keyword=${encodeURIComponent(keyword || "")}`),
 
   getEvents: (taskId) =>
     request(`/tasks/${encodeURIComponent(taskId)}/events/history`),

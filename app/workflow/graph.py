@@ -16,6 +16,8 @@ NODE_SEQUENCE: tuple[tuple[str, str, int], ...] = (
     ("render_document", "解析文档", 5),
     ("transcribe_pages", "图像转写", 25),
     ("classify_pages", "识别主单/分单/舱单", 45),
+    # 先整页转写并分类，再只对分单页做四象限局部精读（小字特写）
+    ("transcribe_house_zoom", "分单局部精读", 48),
     ("extract_documents", "抽取分单与舱单字段", 55),
     ("verify_consistency", "核对分单与舱单", 85),
     ("build_result", "生成结果", 95),
@@ -35,12 +37,12 @@ def _first_pending_node(state: AnalysisState) -> str:
 def _route_after_classify(state: AnalysisState) -> str:
     """没有分单段（例如整份文件只有主单）时，直接跳到结果装配。
 
-    主单只登记不抽取，继续走抽取/核对节点没有意义，日志里也不该出现这两步。
+    主单只登记不抽取，继续走局部精读/抽取/核对节点没有意义，日志里也不该出现这几步。
     """
 
     segments = state.get("segments") or ()
     if any(item.get("kind") == "house_bill" for item in segments):
-        return "extract_documents"
+        return "transcribe_house_zoom"
     return "build_result"
 
 
@@ -68,11 +70,14 @@ class AnalysisGraph:
             source = NODE_SEQUENCE[index][0]
             target = NODE_SEQUENCE[index + 1][0]
             if source == "classify_pages":
-                # 只有主单（无分单）时跳过抽取与核对，直接装配结果
+                # 只有主单（无分单）时跳过局部精读/抽取/核对，直接装配结果
                 graph.add_conditional_edges(
                     source,
                     _route_after_classify,
-                    {"extract_documents": target, "build_result": "build_result"},
+                    {
+                        "transcribe_house_zoom": "transcribe_house_zoom",
+                        "build_result": "build_result",
+                    },
                 )
             else:
                 graph.add_edge(source, target)

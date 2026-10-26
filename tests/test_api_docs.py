@@ -9,6 +9,15 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 
 
+def _upload_form_schema(spec: dict) -> dict:
+    """按关键字定位上传请求体 schema：operation id 会随接口前缀变化。"""
+
+    for name, schema in spec["components"]["schemas"].items():
+        if "create_task" in name and name.startswith("Body_"):
+            return schema
+    raise AssertionError("未找到上传请求体 schema")
+
+
 def test_openapi_json_declares_utf8_charset() -> None:
     client = TestClient(create_app())
     response = client.get("/openapi.json")
@@ -23,7 +32,7 @@ def test_post_field_descriptions_are_readable() -> None:
     client = TestClient(create_app())
     spec = client.get("/openapi.json").json()
 
-    form = spec["components"]["schemas"]["Body_create_task_dz_analysis_tasks_post"]
+    form = _upload_form_schema(spec)
     assert "单证文件" in form["properties"]["files"]["description"]
 
     submit = spec["components"]["schemas"]["SubmitRequest"]["properties"]
@@ -37,7 +46,7 @@ def test_upload_fields_use_binary_format() -> None:
     client = TestClient(create_app())
     spec = client.get("/openapi.json").json()
 
-    form = spec["components"]["schemas"]["Body_create_task_dz_analysis_tasks_post"]
+    form = _upload_form_schema(spec)
     files_schema = form["properties"]["files"]
 
     assert files_schema["anyOf"][0]["items"] == {"type": "string", "format": "binary"}

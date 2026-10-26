@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "DocMind DZ"
-    api_prefix: str = "/dz"
+    api_prefix: str = "/docmind_dz"
     app_host: str = "127.0.0.1"
     app_port: int = 8010
 
@@ -76,9 +76,7 @@ class Settings(BaseSettings):
     render_dpi: int = 200
     # Word/Excel 是否用 LibreOffice 转 PDF 后渲染页图（关闭则只抽文本，无页面图片）
     office_render_enabled: bool = True
-    # 文本层字符数低于该值视为“扫描件”，需要 VLM 转写
-    text_layer_min_chars: int = 180
-    force_vlm: bool = False
+
 
     # 模型（OpenAI 兼容接口）
     model_api_key: str | None = None
@@ -86,14 +84,18 @@ class Settings(BaseSettings):
     model_name: str = "deepseek-flash"
     model_vision_name: str = "deepseek-flash"
     model_temperature: float = 0.0
-    model_thinking: bool = False
+    # 字段提取/分类开思考：候选更稳，代价是耗时明显变长（可按需用环境变量关掉）
+    model_thinking: bool = True
+    # 识图转写关思考：逐字转写不需要推理，开启后更慢，实测准确率差异很小
+    model_vision_thinking: bool = False
 
     fallback_api_key: str | None = None
     fallback_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     fallback_name: str = "qwen-plus"
     fallback_vision_name: str = "qwen-vl-max"
 
-    model_timeout_seconds: float = 180.0
+    # 文本调用（字段抽取/分类）超时：开思考后耗时明显变长，留足余量
+    model_timeout_seconds: float = 300.0
     model_vision_timeout_seconds: float = 120.0
     model_connect_timeout_seconds: float = 10.0
     model_call_retries: int = 1
@@ -110,9 +112,6 @@ class Settings(BaseSettings):
     # provider 熔断：连续失败 N 次进入冷却，冷却期内直接走兜底
     model_circuit_failures: int = Field(default=3, ge=1)
     model_circuit_cooldown_seconds: float = 90.0
-
-    # 本地演示模式：不调用真实模型
-    mock_llm: bool = False
 
     # 抽取置信度低于该值的单据进入「待审核」
     review_confidence_threshold: float = 0.7

@@ -110,7 +110,7 @@ USER docmind
 
 EXPOSE 8010
 
-# 探活走应用自带的 /health（会回报 mock_llm 与模型是否就绪）
+# 探活走应用自带的 /health（会回报模型是否就绪）
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('DOCMIND_DZ_APP_PORT', '8010') + '/health', timeout=4)"
 

@@ -1,4 +1,4 @@
-"""测试公共夹具：临时数据目录、mock 模型、样例 PDF 生成。"""
+"""测试公共夹具：临时数据目录、假模型网关、样例 PDF 生成。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from app.config import Settings
+from app.service.task_service import TaskService
+from tests.fake_gateway import FakeModelGateway
 
 
 @pytest.fixture(autouse=True)
@@ -23,12 +25,16 @@ def settings(tmp_path: Path) -> Settings:
     return Settings(
         data_root=tmp_path / "data",
         log_dir=tmp_path / "logs",
-        mock_llm=True,
         house_bill_concurrency=1,
-        text_layer_min_chars=20,
         office_render_enabled=False,
         model_api_key="test-key",
     )
+
+
+def make_service(settings: Settings) -> TaskService:
+    """注入假网关的任务服务：离线跑通管线、核对与前端契约。"""
+
+    return TaskService(settings, gateway=FakeModelGateway(settings))
 
 
 MASTER_PAGE = """MASTER AIR WAYBILL

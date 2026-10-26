@@ -295,9 +295,15 @@ function houseCell(tab, comparison, key, label, pos = {}, scope = "row") {
   const attrs = `id="${esc(inputId)}" class="${controlClass}" data-tab="${esc(
     tab.id
   )}" data-key="${esc(key)}"${dateAttr}${disabled}`;
+  const isPort = key === "sfg" || key === "mdg";
   const field = pos.textarea
     ? `<textarea ${attrs} rows="1">${esc(value)}</textarea>`
-    : `<input ${attrs} type="text" value="${esc(value)}" />`;
+    : isPort
+      ? `<div class="awb-port-combo">
+          <input ${attrs} type="text" autocomplete="off" value="${esc(value)}" />
+          <div class="awb-port-menu" hidden></div>
+        </div>`
+      : `<input ${attrs} type="text" value="${esc(value)}" />`;
   const control = pos.date
     ? `<div class="awb-date-wrap">
         ${field}
@@ -1010,12 +1016,112 @@ function autoSizeTextareas() {
   root?.querySelectorAll(".doc-textarea").forEach(autoSizeTextarea);
 }
 
+// ---------------------------------------------------------------- port combobox
+// 港口字段（sfg/mdg）点击后可搜索三字码：本地 hbinfo.json，不调模型
+const PORT_SEARCH_DELAY = 250;
+const portTimers = new WeakMap();
+
+function portMenu(input) {
+  return input?.parentElement?.querySelector(".awb-port-menu") || null;
+}
+
+function hidePortMenu(input) {
+  const menu = portMenu(input);
+  if (!menu) return;
+  menu.hidden = true;
+  menu.innerHTML = "";
+}
+
+function schedulePortSearch(input) {
+  // 刚选中候选项时不要立刻重新搜索，否则菜单会马上弹回来
+  if (input.dataset.skipPortSearch === "1") return;
+  const keyword = String(input.value || "").trim();
+  clearTimeout(portTimers.get(input));
+  if (keyword.length < 2) {
+    hidePortMenu(input);
+    return;
+  }
+  portTimers.set(
+    input,
+    setTimeout(() => runPortSearch(input, keyword), PORT_SEARCH_DELAY)
+  );
+}
+
+async function runPortSearch(input, keyword) {
+  const menu = portMenu(input);
+  if (!menu) return;
+  menu.hidden = false;
+  menu.innerHTML = '<div class="awb-port-tip">搜索中…</div>';
+  try {
+    const data = await api.searchPorts(keyword);
+    if (!input.isConnected) return;
+    if (data.enabled === false) {
+      menu.innerHTML = '<div class="awb-port-tip">三字码缓存未配置</div>';
+      return;
+    }
+    const items = data.items || [];
+    if (!items.length) {
+      menu.innerHTML = '<div class="awb-port-tip">无匹配三字码</div>';
+      return;
+    }
+    menu.innerHTML = items
+      .map(
+        (item) => `<button type="button" class="awb-port-option" data-code="${esc(
+          item.three_code
+        )}"><span class="awb-port-code">${esc(
+          item.three_code
+        )}</span><span class="awb-port-name">${esc(
+          item.english_name || ""
+        )}</span></button>`
+      )
+      .join("");
+  } catch {
+    if (input.isConnected) {
+      menu.innerHTML = '<div class="awb-port-tip">搜索失败</div>';
+    }
+  }
+}
+
+function selectPortOption(option) {
+  const combo = option.closest(".awb-port-combo");
+  const input = combo?.querySelector(".doc-input");
+  if (!input) return;
+  input.value = option.dataset.code || "";
+  input.dataset.portPicked = "1";
+  input.dataset.skipPortSearch = "1";
+  setTimeout(() => delete input.dataset.skipPortSearch, 400);
+  hidePortMenu(input);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.focus();
+}
+
+function movePortActive(input, step) {
+  const menu = portMenu(input);
+  if (!menu || menu.hidden) return;
+  const options = [...menu.querySelectorAll(".awb-port-option")];
+  if (!options.length) return;
+  const current = options.findIndex((option) =>
+    option.classList.contains("is-active")
+  );
+  const index = (current + step + options.length) % options.length;
+  options.forEach((option, position) =>
+    option.classList.toggle("is-active", position === index)
+  );
+  options[index].scrollIntoView({ block: "nearest" });
+}
+
 function onInput(event) {
   const input = event.target.closest(".doc-input");
   if (!input) return;
   if (input.tagName === "TEXTAREA") autoSizeTextarea(input);
   const key = input.dataset.key;
   const entryId = input.dataset.manifestEntry;
+  const portInput = !entryId && (key === "sfg" || key === "mdg");
+  if (portInput && input.dataset.portPicked !== "1") {
+    // 港口字段只能从下拉选：手输只用于过滤，不写入字段值
+    schedulePortSearch(input);
+    return;
+  }
   if (entryId) {
     state.manifestEdits[entryId] = state.manifestEdits[entryId] || {};
     state.manifestEdits[entryId][key] = input.value;
@@ -1026,6 +1132,7 @@ function onInput(event) {
     state.edits[tabId][key] = input.value;
     state.errors.delete(`${tabId}:${key}`);
   }
+  if (portInput) delete input.dataset.portPicked;
   const tab = activeTab();
   if (tab && tab.type === "house_bill") {
     const row = input.closest(".awb-cell");
@@ -1173,6 +1280,53 @@ function bindEvents() {
   });
 
   root.addEventListener("input", onInput);
+
+  // 港口下拉：鼠标选中、键盘上下/回车、失焦关闭
+  root.addEventListener("mousedown", (event) => {
+    const option = event.target.closest(".awb-port-option");
+    if (!option) return;
+    event.preventDefault();
+    selectPortOption(option);
+  });
+
+  root.addEventListener("keydown", (event) => {
+    const portInput = event.target.closest(".awb-port-combo .doc-input");
+    if (!portInput) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      movePortActive(portInput, 1);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      movePortActive(portInput, -1);
+      return;
+    }
+    if (event.key === "Enter") {
+      const active = portMenu(portInput)?.querySelector(".awb-port-option.is-active");
+      if (active) {
+        event.preventDefault();
+        selectPortOption(active);
+      }
+      return;
+    }
+    if (event.key === "Escape") hidePortMenu(portInput);
+  });
+
+  root.addEventListener("focusout", (event) => {
+    const portInput = event.target.closest(".awb-port-combo .doc-input");
+    if (!portInput) return;
+    setTimeout(() => {
+      if (document.activeElement === portInput) return;
+      hidePortMenu(portInput);
+      // 手输未选中：恢复成字段当前值，避免把搜索词当成三字码
+      const tab = activeTab();
+      if (!tab) return;
+      const key = portInput.dataset.key;
+      const fallback = valueFor(tab.id, key, originalValue(tab, key)) || "";
+      if (portInput.value !== fallback) portInput.value = fallback;
+    }, 120);
+  });
 
   // 聚焦表单字段 → 左侧原图滚动到对应页并高亮字段值（分单/舱单都支持）
   root.addEventListener("focusin", (event) => {
@@ -1342,19 +1496,3 @@ export function isSubmitDialogOpen() {
   return Boolean(root && state.result);
 }
 
-// 供主页面「差异列表」直接定位到字段
-export function focusReviewItem(tabId, key) {
-  if (!isSubmitDialogOpen()) return;
-  if (tabId !== state.activeTab) {
-    const tab = state.tabs.find((item) => item.id === tabId);
-    if (tab) switchTab(tab.id);
-  }
-  const houseKey = HOUSE_KEY_ALIASES[key] || key;
-  const row = key.startsWith("manifest:")
-    ? root.querySelector(`[data-row="${key}"]`)
-    : root.querySelector(`[data-row="${tabId}:${houseKey}"]`);
-  const fallbackRow = row || root.querySelector("#docFormPane");
-  fallbackRow?.scrollIntoView({ block: "center", behavior: "smooth" });
-  fallbackRow?.classList.add("is-highlight");
-  setTimeout(() => fallbackRow?.classList.remove("is-highlight"), 1600);
-}

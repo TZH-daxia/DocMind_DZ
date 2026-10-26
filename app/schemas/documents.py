@@ -34,6 +34,8 @@ class PageRecord(BaseModel):
 
     index: int = Field(description="1 起的页序号")
     text: str = ""
+    # 转写全文的落盘路径（document.json 只记路径，正文在 transcription/page_00N.md）
+    text_rel: str | None = None
     text_source: TextSource = "empty"
     image_rel: str | None = None
     char_count: int = 0
@@ -43,10 +45,9 @@ class PageRecord(BaseModel):
     # 多文件上传时记录来源文件与文件内页码
     source_file: str | None = None
     page_in_file: int | None = None
-
-    @property
-    def needs_vlm(self) -> bool:
-        return self.image_rel is not None
+    # 分单页四象限局部精读结果（小字更清晰），抽取时优先于整页转写
+    zoom_text: str | None = None
+    zoom_rel: str | None = None
 
 
 class Segment(BaseModel):
@@ -72,6 +73,30 @@ class MasterBillInfo(BaseModel):
     skipped: bool = True
 
 
+CandidateStatus = Literal["confirmed", "needs_review", "conflict", "missing"]
+
+
+class FieldEvidence(BaseModel):
+    """候选值的原文引用：quote 必须是 VLM 转写文档中的逐字片段。"""
+
+    quote: str | None = None
+    page: int | None = None
+
+
+class FieldCandidate(BaseModel):
+    """一个字段的候选：值 + 状态 + 置信度 + 原文引用，用于逐字段复核。"""
+
+    field_key: str
+    value: str | None = None
+    raw_value: str | None = None
+    status: CandidateStatus = "confirmed"
+    confidence: float = 0.6
+    evidence: list[FieldEvidence] = Field(default_factory=list)
+    # 同一字段在页面出现多个不同值时的其它候选（不擅自替用户选择）
+    alternatives: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class HouseBill(BaseModel):
     bill_id: str
     segment_id: str
@@ -79,10 +104,10 @@ class HouseBill(BaseModel):
     fields: dict[str, str | None] = Field(default_factory=dict)
     # 字段在原图中的位置：key → [{page, bbox:[x,y,w,h]}]，供前端点击字段时高亮
     field_locations: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
-    # 无法确定标准值时保留的原文（如港口只写了城市名），供待审核引用
-    field_evidence: dict[str, str] = Field(default_factory=dict)
     # 定位用的页面原文（如港口归一成三字码后，原文仍用于在原图上找位置）
     field_sources: dict[str, str] = Field(default_factory=dict)
+    # 字段级候选（含 missing），便于对照「转写 vs 提取」与逐字段复核
+    candidates: list[FieldCandidate] = Field(default_factory=list)
     confidence: float = 0.6
     warnings: list[str] = Field(default_factory=list)
     source_excerpt: str = ""

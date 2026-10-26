@@ -1,6 +1,18 @@
 """港口字段口径：只保留三字码，确定不了则留空并带回原文。"""
 
+import pytest
+
+from app.config import Settings
+from app.service.port_reference import PortReferenceIndex
 from app.service.ports import normalize_port_fields, resolve_port
+
+
+@pytest.fixture(scope="module")
+def index():
+    reference = PortReferenceIndex.load(Settings().data_root)
+    if reference is None:
+        pytest.skip("reference cache missing")
+    return reference
 
 
 def test_three_letter_code_is_kept():
@@ -15,7 +27,15 @@ def test_airport_alias_is_normalized():
 
 def test_airport_full_name_is_resolved():
     assert resolve_port("SHANGHAI PUDONG INTERNATIONAL APT") == ("PVG", "")
-    assert resolve_port("DALLAS-FORT WORTH INT") == ("DFW", "")
+    assert resolve_port("DFW") == ("DFW", "")
+
+
+def test_reference_cache_is_source_of_truth(index):
+    """三字码与城市名都以 hbinfo.json 为准，不再维护别名表。"""
+
+    assert resolve_port("GUADALAJARA", index=index) == ("GDL", "")
+    assert resolve_port("DALLAS/FORTWORTH", index=index) == ("DAL", "")
+    assert resolve_port("SHANGHAI", index=index) == (None, "SHANGHAI")
 
 
 def test_ambiguous_city_keeps_raw_text():

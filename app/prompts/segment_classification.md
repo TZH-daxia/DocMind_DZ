@@ -2,7 +2,7 @@
 
 ## 类别定义
 
-- `master_bill`：**主单/总单（MAWB / Master Air Waybill）**。特征：标题含 AIR WAYBILL、MAWB、MASTER AIR WAYBILL、主单、总单、主运单、总运单，或印有 NOT NEGOTIABLE；有 11 位主单号（3 位航司代码 + 8 位序号，如 999-12345678）；通常有 “Issued by / Carrier” 栏。
+- `master_bill`：**主单/总单（MAWB / Master Air Waybill）**。必须能看到 **11 位主单号**（3 位航司代码 + 8 位序号，如 999-12345678）或 `MAWB` / `MASTER AIR WAYBILL` 标题；仅有 `AIR WAYBILL` 字样、没有主单号的条款/说明页不算主单。
 - `house_bill`：**分单（HAWB / House Air Waybill）**。特征：标题含 HAWB、HOUSE AIR WAYBILL、分单、分运单；有独立的分单号；收发货人为具体货主。
 - `manifest`：**舱单/装载清单（Cargo Manifest）**。特征：标题含 舱单、MANIFEST、CARGO MANIFEST、装载清单；主体是多行表格，每行一个分单号。
 - `other`：与上述无关的页面（空白页、说明页、发票、装箱单等）。
@@ -10,7 +10,8 @@
 ## 判定规则
 
 1. **分单优先于主单**：分单页面常以 `MAWB No. 999-12345678` 引用主单号，只要页面出现 HAWB / 分单号 / 分运单等**明确的分单标识**，就判为 `house_bill`；没有 HAWB 标注的普通参考号（如 `WPL26100101` 这类货代参考号）不算分单标识。
-2. 主单页不会出现 HAWB / 分单号；标题为 `AIR WAYBILL` / `NOT NEGOTIABLE`，或只有 11 位主单号 + 起讫港 + 运价/重量栏时，判 `master_bill`。
+2. 主单页不会出现 HAWB / 分单号；标题为 `AIR WAYBILL` / `NOT NEGOTIABLE` **且能看到主单号**，或只有 11 位主单号 + 起讫港 + 运价/重量栏时，判 `master_bill`。
+2a. **条款/责任限制/说明页判 `other`**：出现 `NOTICE CONCERNING CARRIER'S LIMITATION OF LIABILITY`、`CONDITIONS OF CONTRACT`、承运人责任限制、条款等说明文字时，即使含 `Air Waybill`、航班、发货人/收货人等词，也不要判 `master_bill`。
 3. 舱单页即使同时出现 MAWB 号，也判为 `manifest`（表格 + 舱单标题优先）。
 4. 无标题、但明显是上一页表格或字段的延续（列结构相同、出现 “续页/CONTD/PAGE 2 OF 3”）时，沿用上一页的类别，并置 `continuation=true`。
 5. 同一页只输出一个类别。无法判断填 `other`。

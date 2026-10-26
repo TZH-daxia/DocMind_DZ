@@ -13,6 +13,10 @@ def load_page_transcription_prompt() -> str:
     return _load("page_transcription.md")
 
 
+def load_house_zoom_prompt() -> str:
+    return _load("house_zoom_transcription.md")
+
+
 def load_segment_classification_prompt() -> str:
     return _load("segment_classification.md")
 

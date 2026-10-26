@@ -192,3 +192,22 @@ def test_two_house_bills_are_split_by_header():
         "manifest",
     ]
     assert segments[3].page_indexes == [4, 5]
+
+
+NOTICE_PAGE = """NOTICE CONCERNING CARRIER'S LIMITATION OF LIABILITY
+If the carriage involves an ultimate destination or stop in a country other
+than the country of departure, the Warsaw Convention may be applicable.
+Air Waybill
+Shipper's Name and Address
+Consignee's Name and Address
+Airport of Departure and Requested Routing
+"""
+
+
+def test_notice_page_without_master_no_is_not_master_bill():
+    """条款页含 Air Waybill、航班/当事人等词，但没有主单号，不能判主单。"""
+
+    signal = detect_master_bill(NOTICE_PAGE)
+    assert signal.is_master is False
+    kind = classify_page_by_rules(NOTICE_PAGE, previous_kind=None)
+    assert kind.kind != "master_bill"

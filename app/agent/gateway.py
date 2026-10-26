@@ -55,14 +55,24 @@ class ModelGateway:
         label: str,
         system_prompt: str,
         human_prompt: str,
-        image_paths: list[str | Path],
+        image_paths: list[str | Path] | None = None,
+        *,
+        image_bytes: list[bytes] | None = None,
     ) -> str:
         content: list[dict[str, object]] = [{"type": "text", "text": human_prompt}]
-        for path in image_paths:
+        for path in image_paths or []:
             content.append(
                 {
                     "type": "image_url",
                     "image_url": {"url": _image_data_url(Path(path))},
+                }
+            )
+        # 局部切图只在内存里转 base64，不落盘到任务目录
+        for payload in image_bytes or []:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _bytes_data_url(payload)},
                 }
             )
         messages = [
@@ -130,16 +140,15 @@ def _content_to_text(content: object) -> str:
 def _image_data_url(path: Path) -> str:
     mime, _ = mimetypes.guess_type(path.name)
     mime = mime or "image/png"
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return _bytes_data_url(path.read_bytes(), mime)
+
+
+def _bytes_data_url(content: bytes, mime: str = "image/png") -> str:
+    encoded = base64.b64encode(content).decode("ascii")
     return f"data:{mime};base64,{encoded}"
 
 
 def build_gateway(settings: Settings, gates: ConcurrencyGates | None = None):
-    """按配置构造网关；mock 模式返回固定样例网关。"""
+    """按配置构造真实模型网关。"""
 
-    if settings.mock_llm:
-        from app.agent.mock import MockModelGateway
-
-        logger.warning("已启用 MOCK_LLM：不会调用真实模型，仅用于本地演示")
-        return MockModelGateway(settings)
     return ModelGateway(settings, gates=gates)

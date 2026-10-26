@@ -24,7 +24,7 @@ from tests.conftest import MANIFEST_PAGE, MASTER_PAGE, house_page, write_pdf  # 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:8010")
-    parser.add_argument("--prefix", default="/dz")
+    parser.add_argument("--prefix", default="/docmind_dz")
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument(
         "--file",

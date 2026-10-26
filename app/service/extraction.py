@@ -18,6 +18,7 @@ from app.agent.parsing import (
 )
 from app.prompts.loader import (
     load_house_bill_extraction_prompt,
+    load_house_zoom_prompt,
     load_manifest_extraction_prompt,
     load_page_transcription_prompt,
     load_segment_classification_prompt,
@@ -39,7 +40,8 @@ from app.service.ports import normalize_port_fields
 logger = logging.getLogger(__name__)
 
 PAGE_HEADER = "<<<PAGE {index}>>>"
-MAX_PAGE_CHARS = 6000
+# 分单页会同时带「局部精读 + 整页转写」，上限放宽；仍保留截断防止超长页打爆上下文
+MAX_PAGE_CHARS = 12000
 
 # 标准键保持「舱单 / 核对口径」；分单接口名（mdg/zdpiece…）作为别名，
 # 分单归一化时再统一改写成接口字段名，避免舱单字段被分单命名吃掉。
@@ -139,11 +141,26 @@ class ExtractionError(RuntimeError):
         self.message = message
 
 
+def _page_content(page: PageRecord) -> str:
+    """页面内容：分单页优先给局部精读，整页转写留作版面参考。"""
+
+    text = page.text.strip()
+    zoom = (page.zoom_text or "").strip()
+    if not zoom:
+        return text
+    return (
+        "### 局部放大精读（优先采信）\n"
+        + zoom
+        + "\n\n### 整页转写（版面参考）\n"
+        + text
+    )
+
+
 def format_pages(pages: list[PageRecord], indexes: list[int] | None = None) -> str:
     selected = [page for page in pages if indexes is None or page.index in indexes]
     chunks: list[str] = []
     for page in selected:
-        text = page.text.strip()
+        text = _page_content(page)
         if len(text) > MAX_PAGE_CHARS:
             text = text[:MAX_PAGE_CHARS] + "\n…（本页内容过长已截断）"
         chunks.append(PAGE_HEADER.format(index=page.index) + "\n" + (text or "（本页无文本）"))
@@ -158,6 +175,23 @@ async def transcribe_page(gateway, page: PageRecord, image_path: str) -> str:
         load_page_transcription_prompt(),
         f"请逐字转写第 {page.index} 页的全部内容。",
         [image_path],
+    )
+
+
+async def transcribe_house_zoom(
+    gateway, page: PageRecord, image_bytes: list[bytes]
+) -> str:
+    """分单页四象限局部精读：四张放大图一次调用，逐块逐字转写。
+
+    图片只在内存里转 base64，不落盘到任务目录。
+    """
+
+    return await gateway.complete_vision(
+        "分单局部精读",
+        load_house_zoom_prompt(),
+        f"以下是第 {page.index} 页（分单）的四个局部放大图，"
+        "请按左上、右上、左下、右下顺序逐字转写。",
+        image_bytes=image_bytes,
     )
 
 
@@ -381,11 +415,74 @@ def _normalize_house_bill_payload(payload: dict[str, Any]) -> dict[str, Any]:
         warnings.append(f"分单有 {len(missing)} 个核心字段未取到值")
     if not fields.get("hawb"):
         warnings.append("未识别到分单号，无法与舱单核对")
+    confidence = _to_float(payload.get("confidence"), 0.6)
     return {
         "fields": fields,
-        "confidence": _to_float(payload.get("confidence"), 0.6),
+        "candidates": _build_candidates(fields, payload.get("evidence"), confidence),
+        "confidence": confidence,
         "warnings": warnings,
     }
+
+
+def _candidate_meta(raw: Any) -> dict[str, dict[str, Any]]:
+    """把模型输出的 evidence 归一成 {字段: {quote/status/confidence/alternatives}}。"""
+
+    result: dict[str, dict[str, Any]] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                result[str(key).strip()] = value
+            elif value not in (None, ""):
+                result[str(key).strip()] = {"quote": str(value).strip()}
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and item.get("field_key"):
+                result[str(item["field_key"]).strip()] = item
+    return result
+
+
+def _build_candidates(
+    fields: dict[str, str | None], raw_evidence: Any, overall_confidence: float
+) -> list[dict[str, Any]]:
+    """为全部字段生成候选（含 missing），保留 quote/status/confidence。"""
+
+    meta_map = _candidate_meta(raw_evidence)
+    candidates: list[dict[str, Any]] = []
+    for key in HOUSE_FIELD_KEYS:
+        value = fields.get(key)
+        meta = meta_map.get(key) or {}
+        quote = meta.get("quote")
+        quote_text = str(quote).strip()[:200] if quote else None
+        status = str(meta.get("status") or "").strip().lower()
+        if not value:
+            status = "missing"
+        elif status not in {"confirmed", "needs_review", "conflict"}:
+            status = "confirmed"
+        raw_alternatives = meta.get("alternatives")
+        if isinstance(raw_alternatives, str):
+            alternatives = [raw_alternatives.strip()] if raw_alternatives.strip() else []
+        elif isinstance(raw_alternatives, list):
+            alternatives = [
+                str(item).strip() for item in raw_alternatives if str(item).strip()
+            ]
+        else:
+            alternatives = []
+        raw_value = meta.get("raw_value")
+        candidates.append(
+            {
+                "field_key": key,
+                "value": value,
+                "raw_value": str(raw_value).strip() if raw_value else None,
+                "status": status,
+                "confidence": _to_float(
+                    meta.get("confidence"), overall_confidence
+                ),
+                "evidence": ([{"quote": quote_text}] if quote_text else []),
+                "alternatives": alternatives,
+                "warnings": [],
+            }
+        )
+    return candidates
 
 
 def _to_float(value: Any, default: float) -> float:

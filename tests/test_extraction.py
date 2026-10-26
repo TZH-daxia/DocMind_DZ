@@ -3,6 +3,7 @@
 import json
 
 from app.schemas.documents import PageRecord
+from app.schemas.fields import HOUSE_FIELD_KEYS
 from app.service.extraction import (
     _normalize_house_bill_payload,
     canonical_payload,
@@ -157,3 +158,35 @@ async def test_manifest_skips_master_rows():
     pages = [PageRecord(index=1, text="CARGO MANIFEST")]
     result = await extract_manifest(_FakeMasterRowGateway(), pages, [1])
     assert [entry["fields"]["hawb_no"] for entry in result["entries"]] == ["WPL26100101"]
+
+
+def test_house_candidates_keep_evidence_and_missing():
+    """候选层：有值字段保留 quote/status/confidence，缺失字段补 missing。"""
+
+    payload = {
+        "fields": {"hawb": "HAWB0001", "sfg": "PVG"},
+        "evidence": {
+            "hawb": {
+                "quote": "HAWB: HAWB0001",
+                "status": "confirmed",
+                "confidence": 0.95,
+            },
+            "sfg": {
+                "quote": "Airport of Departure PVG",
+                "status": "confirmed",
+                "confidence": 0.9,
+            },
+        },
+        "confidence": 0.8,
+    }
+
+    result = _normalize_house_bill_payload(payload)
+    candidates = {item["field_key"]: item for item in result["candidates"]}
+
+    assert candidates["hawb"]["value"] == "HAWB0001"
+    assert candidates["hawb"]["evidence"][0]["quote"] == "HAWB: HAWB0001"
+    assert candidates["hawb"]["confidence"] == 0.95
+    assert candidates["mdg"]["status"] == "missing"
+    assert candidates["mdg"]["value"] is None
+    # 全部字段都应有候选，缺值字段也不能少
+    assert len(result["candidates"]) == len(HOUSE_FIELD_KEYS)

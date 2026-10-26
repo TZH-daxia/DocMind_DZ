@@ -2214,3 +2214,65 @@ textarea {
     margin: 10px 10px 16px;
   }
 }
+
+/* ---------------------------------------------------------------- port combobox */
+/* 港口字段（Airport of Departure / Destination）的三字码搜索下拉 */
+.awb-port-combo {
+  position: relative;
+}
+
+.awb-port-menu {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  z-index: 30;
+  min-width: 100%;
+  width: max-content;
+  max-width: 320px;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+}
+
+.awb-port-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: var(--ink);
+}
+
+.awb-port-option:hover,
+.awb-port-option.is-active {
+  background: var(--blue-soft);
+}
+
+.awb-port-code {
+  font-family: var(--mono);
+  font-weight: 600;
+}
+
+.awb-port-name {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.awb-port-tip {
+  padding: 6px 8px;
+  color: var(--muted);
+  font-size: 12px;
+}

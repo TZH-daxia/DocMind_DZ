@@ -7,7 +7,7 @@
 #   docker compose up -d --build
 #   docker compose ps
 #
-# 对外地址：https://ai.wecanintl.com:8444/dz/...
+# 对外地址：https://ai.wecanintl.com:8444/docmind_dz/...
 services:
   docmind-dz:
     build:
@@ -79,7 +79,7 @@ services:
     volumes:
       # 覆盖镜像自带的 default.conf：我们的文件是完整 server 块，
       # conf.d/*.conf 在 http 级被 include，放这里正好
-      - ./deploy/nginx/dz.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/nginx/docmind_dz.conf:/etc/nginx/conf.d/default.conf:ro
       # 复用现成的泛域名证书（*.wecanintl.com 已覆盖 ai.wecanintl.com），只读挂载，
       # 证书续期后自动生效，不用重新拷贝。
       # 想彻底拷贝一份到自己项目时，换成 ./deploy/nginx/certs 并自行同步，

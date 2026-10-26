@@ -253,12 +253,90 @@ def _libreoffice_binary() -> str | None:
     return None
 
 
+def _prepare_print_friendly_xlsx(source: Path, temp_dir: Path) -> Path | None:
+    """复制 xlsx 并设置「宽度适配一页」的打印设置。
+
+    LibreOffice CLI 无法传页面设置，宽表会按默认打印分页被左右拆成两张图。
+    这里先把每个 sheet 设为 fitToWidth=1、fitToHeight=0：
+    先横向缩到一页宽，纵向放不下再自然上下分页。
+    """
+
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.worksheet.properties import PageSetupProperties
+    except ImportError:  # pragma: no cover - 缺依赖时退回原文件
+        return None
+
+    target = temp_dir / source.name
+    try:
+        workbook = load_workbook(source)
+        for sheet in workbook.worksheets:
+            sheet.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+            sheet.page_setup.fitToWidth = 1
+            sheet.page_setup.fitToHeight = 0
+        workbook.save(target)
+        workbook.close()
+    except Exception as exc:  # noqa: BLE001 - 打印设置失败不阻断转换
+        logger.warning("Excel 打印设置失败：%s（%s）", source.name, exc)
+        return None
+    return target
+
+
 def _office_to_pdf(source: Path, out_dir: Path) -> Path | None:
     """用 LibreOffice headless 把 Office 文档转成 PDF；失败返回 None 由调用方回退。"""
 
     binary = _libreoffice_binary()
     if binary is None:
         return None
+
+    suffix = source.suffix.lower()
+    if suffix == ".xlsx":
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="docmind_dz_xlsx_") as temp:
+            prepared = _prepare_print_friendly_xlsx(source, Path(temp))
+            return _run_office_pdf(binary, prepared or source, out_dir, source.stem)
+    if suffix == ".xls":
+        # 老格式 openpyxl 不能直接写：先转 xlsx，再套同一套「宽度适配一页」设置
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="docmind_dz_xls_") as temp:
+            temp_dir = Path(temp)
+            xlsx = _convert_to_xlsx(binary, source, temp_dir)
+            if xlsx is None:
+                return _run_office_pdf(binary, source, out_dir, source.stem)
+            prepared_dir = temp_dir / "print"
+            prepared_dir.mkdir()
+            prepared = _prepare_print_friendly_xlsx(xlsx, prepared_dir)
+            return _run_office_pdf(binary, prepared or xlsx, out_dir, source.stem)
+    return _run_office_pdf(binary, source, out_dir, source.stem)
+
+
+def _convert_to_xlsx(binary: str, source: Path, out_dir: Path) -> Path | None:
+    """用 LibreOffice 把 .xls 转成 xlsx，供 openpyxl 设置打印页宽。"""
+
+    command = [
+        binary,
+        "--headless",
+        "--norestore",
+        "--convert-to",
+        "xlsx",
+        "--outdir",
+        str(out_dir),
+        str(source),
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, timeout=120)
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("xls 转 xlsx 失败：%s（%s）", source.name, exc)
+        return None
+    target = out_dir / f"{source.stem}.xlsx"
+    return target if target.exists() else None
+
+
+def _run_office_pdf(
+    binary: str, source: Path, out_dir: Path, stem: str
+) -> Path | None:
     command = [
         binary,
         "--headless",
@@ -274,7 +352,7 @@ def _office_to_pdf(source: Path, out_dir: Path) -> Path | None:
     except (subprocess.SubprocessError, OSError) as exc:
         logger.warning("Office 转 PDF 失败：%s（%s）", source.name, exc)
         return None
-    target = out_dir / f"{source.stem}.pdf"
+    target = out_dir / f"{stem}.pdf"
     return target if target.exists() else None
 
 
@@ -329,9 +407,6 @@ class ParserRegistry:
         if parser is None:
             raise ParserError("FILE_TYPE_NOT_SUPPORTED", f"暂不支持的文件类型：{suffix}")
         return parser
-
-    def supports(self, suffix: str) -> bool:
-        return suffix.lower() in self._parsers
 
     @property
     def extensions(self) -> tuple[str, ...]:

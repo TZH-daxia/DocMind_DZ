@@ -1,6 +1,11 @@
 """待审核清单。"""
 
-from app.schemas.documents import HouseBill, ManifestDocument, ManifestEntry
+from app.schemas.documents import (
+    FieldCandidate,
+    HouseBill,
+    ManifestDocument,
+    ManifestEntry,
+)
 from app.schemas.fields import HOUSE_FIELD_KEYS, MANIFEST_FIELD_KEYS, empty_field_map
 from app.service.consistency import compare
 from app.service.review import build_review_items
@@ -85,7 +90,14 @@ def test_mismatch_goes_to_review_but_missing_does_not():
 
 def test_field_evidence_goes_to_review_with_raw_text():
     bill = make_bill()
-    bill.field_evidence = {"sfg": "SHANGHAI"}
+    bill.candidates = [
+        FieldCandidate(
+            field_key="sfg",
+            value=None,
+            raw_value="SHANGHAI",
+            status="needs_review",
+        )
+    ]
 
     items = build_review_items([bill], [], None)
 
