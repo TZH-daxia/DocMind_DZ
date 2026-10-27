@@ -382,28 +382,11 @@ function renderResult() {
   }
 
   const summary = result.summary || {};
+  // 这里只放单据数量；一致/差异/待审核/汇总差异由下方的差异清单表达，不再重复计数
   const pills = [
     `<span class="summary-pill">分单 <b>${summary.total_house_bills ?? 0}</b></span>`,
     `<span class="summary-pill">舱单 <b>${summary.total_manifest_entries ?? 0}</b> 行</span>`,
     `<span class="summary-pill">主单跳过 <b>${(result.master_bills || []).length}</b></span>`,
-    `<span class="summary-pill ready">一致 <b>${summary.consistent ?? 0}</b></span>`,
-    `<span class="summary-pill ${
-      summary.inconsistent > 0 ? "failed" : ""
-    }">差异 <b>${summary.inconsistent ?? 0}</b></span>`,
-    `<span class="summary-pill ${
-      (result.review_items || []).filter((item) => item.reason !== "mismatch").length > 0
-        ? "review"
-        : ""
-    }">待审核 <b>${
-      (result.review_items || []).filter((item) => item.reason !== "mismatch").length
-    }</b></span>`,
-    `<span class="summary-pill ${
-      (result.totals_checks || []).some((item) => item.status === "mismatch")
-        ? "failed"
-        : ""
-    }">汇总差异 <b>${
-      (result.totals_checks || []).filter((item) => item.status === "mismatch").length
-    }</b></span>`,
   ];
   if (snapshot.submitted) {
     pills.push(
