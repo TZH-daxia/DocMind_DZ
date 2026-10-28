@@ -61,9 +61,13 @@ def main() -> int:
             health = client.get(f"{args.base}/health").json()
             print("health:", json.dumps(health, ensure_ascii=False))
 
+            # 一个文件一个任务：接口只接受单个 file 字段；多传时只跑第一个
+            name, _, data, mime = uploads[0]
+            if len(uploads) > 1:
+                print(f"注意：一次只能建一个任务，忽略其余 {len(uploads) - 1} 个文件")
             response = client.post(
                 f"{args.base}{args.prefix}/analysis/tasks",
-                files=[("files", (name, data, mime)) for name, _, data, mime in uploads],
+                files={"file": (name, data, mime)},
             )
             response.raise_for_status()
             task = response.json()

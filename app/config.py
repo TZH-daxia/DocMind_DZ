@@ -58,10 +58,8 @@ class Settings(BaseSettings):
     # 系统日志按天轮转，保留天数（同时限制历史日志占用的磁盘）
     log_retention_days: int = 14
 
-    # 单文件上传限制
+    # 单文件上传限制（一个文件一个任务，不接受一次传多个文件）
     max_file_size_mb: int = 50
-    # 一次上传的文件数上限（前端一个文件一个任务，合并上传时同样受限）
-    max_upload_files: int = 5
     max_pages: int = 30
     # 暂不支持图片文件（png/jpg 等）
     allowed_extensions: tuple[str, ...] = (
@@ -116,8 +114,11 @@ class Settings(BaseSettings):
     # 抽取置信度低于该值的单据进入「待审核」
     review_confidence_threshold: float = 0.7
 
-    # 数据保留
-    data_retention_hours: float = 168.0
+    # 任务产物保留时长（小时）：与托书识别（DocMind）后端同口径。
+    # 服务启动时清理一次，之后每小时清理一次（见 app/main.py 的周期任务）；
+    # 0 表示永久保留。前端解析轮次也按 24h 过期，两边必须一致，否则会出现
+    # 「界面还能点、产物已被清理」或「产物还在、界面已过期」。
+    data_retention_hours: float = Field(default=24.0, ge=0.0)
 
     # 开发调试用：true 时允许任意来源（生产环境不要打开）
     cors_allow_all: bool = False

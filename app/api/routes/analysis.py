@@ -40,18 +40,13 @@ async def search_ports(
 
 @router.post("/tasks", summary="上传单证并创建分析任务")
 async def create_task(
-    files: list[UploadFile] | None = File(
-        default=None, description="单证文件，可一次传多个（PDF / Word / Excel，最多 5 个）"
-    ),
-    file: UploadFile | None = File(
-        default=None, description="兼容单文件上传，与 files 等价"
-    ),
+    file: UploadFile = File(..., description="单证文件（PDF / Word / Excel）"),
     context: str | None = Form(
         default=None, description="附加上下文，JSON 字符串（可选）"
     ),
     service: TaskService = Depends(get_task_service),
 ) -> dict[str, Any]:
-    """一次可上传多个文件（如分单 PDF + 舱单 XLSX），合并为一个分析任务。"""
+    """一个文件一个任务：多个文件请分多次上传，各自独立分析。"""
 
     parsed_context: dict[str, Any] = {}
     if context:
@@ -64,17 +59,13 @@ async def create_task(
                 detail={"code": "CONTEXT_INVALID", "message": "context 必须是合法 JSON"},
             ) from None
 
-    incoming = [*(files or []), *([file] if file is not None else [])]
-    uploads = [
-        UploadedDocument(
-            filename=item.filename or "document",
-            content=await item.read(),
-            content_type=item.content_type,
-        )
-        for item in incoming
-    ]
+    upload = UploadedDocument(
+        filename=file.filename or "document",
+        content=await file.read(),
+        content_type=file.content_type,
+    )
     try:
-        snapshot = service.create_and_start(uploads, parsed_context)
+        snapshot = service.create_and_start(upload, parsed_context)
     except TaskError as exc:
         raise _http_error(exc) from exc
     return snapshot.model_dump(mode="json")

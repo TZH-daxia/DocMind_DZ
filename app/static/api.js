@@ -38,10 +38,10 @@ export const api = {
   getEvents: (taskId) =>
     request(`/tasks/${encodeURIComponent(taskId)}/events/history`),
 
-  createTask(files) {
+  // 一个文件一个任务：后端只接受单个 file 字段
+  createTask(file) {
     const form = new FormData();
-    const list = Array.isArray(files) ? files : [files];
-    for (const file of list) form.append("files", file);
+    form.append("file", file);
     return request("/tasks", { method: "POST", body: form });
   },
 

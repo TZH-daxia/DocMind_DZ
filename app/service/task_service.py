@@ -128,42 +128,20 @@ class TaskService:
     # ------------------------------------------------------------ 创建/启动
     def create_task(
         self,
-        uploads: UploadedDocument | list[UploadedDocument],
+        upload: UploadedDocument,
         context: dict[str, Any] | None = None,
     ) -> TaskSnapshot:
-        files = uploads if isinstance(uploads, list) else [uploads]
-        if not files:
-            raise TaskError("FILE_EMPTY", "请至少上传一个文件")
-        if len(files) > self.settings.max_upload_files:
-            raise TaskError(
-                "FILE_COUNT_EXCEEDED",
-                f"单次最多上传 {self.settings.max_upload_files} 个文件，请重新选择",
-            )
-        for upload in files:
-            self._validate_upload(upload)
+        """一个文件一个任务：不接受文件列表，多个文件由前端分多次上传。"""
 
-        first = files[0]
-        task_id = self.store.new_task_id(first.filename)
-        stored = []
-        for upload in files:
-            path = self.store.save_upload(task_id, upload)
-            stored.append(
-                {
-                    "name": Path(upload.filename or path.name).name,
-                    "path": str(path),
-                    "size": upload.size,
-                }
-            )
+        self._validate_upload(upload)
+
+        task_id = self.store.new_task_id(upload.filename)
+        path = self.store.save_upload(task_id, upload)
 
         created_at = datetime.now().astimezone()
-        source_name = (
-            stored[0]["name"]
-            if len(stored) == 1
-            else f"{stored[0]['name']} 等 {len(stored)} 个文件"
-        )
         status = {
             "task_id": task_id,
-            "source_name": source_name,
+            "source_name": Path(upload.filename or path.name).name,
             "status": "queued",
             "progress": 0,
             "step": "已排队",
@@ -174,9 +152,8 @@ class TaskService:
             "manifest_entry_count": 0,
             "inconsistent_count": 0,
             "context": context or {},
-            # 单文件兼容字段；多文件时 files 才是权威来源
-            "uploaded_path": stored[0]["path"],
-            "files": stored,
+            # 原件路径是唯一权威来源（解析节点据此找文件）
+            "uploaded_path": str(path),
         }
         self._write_status(task_id, status)
         logger.info("创建任务 %s（%s）", task_id, status["source_name"])
@@ -184,10 +161,10 @@ class TaskService:
 
     def create_and_start(
         self,
-        uploads: UploadedDocument | list[UploadedDocument],
+        upload: UploadedDocument,
         context: dict[str, Any] | None = None,
     ) -> TaskSnapshot:
-        snapshot = self.create_task(uploads, context)
+        snapshot = self.create_task(upload, context)
         self.start(snapshot.task_id)
         return snapshot
 
@@ -307,7 +284,6 @@ class TaskService:
         state: AnalysisState = {
             "task_id": task_id,
             "uploaded_path": status.get("uploaded_path", ""),
-            "files": status.get("files") or [],
             "source_name": status.get("source_name", ""),
             "context": status.get("context") or {},
             "created_at": status.get("created_at"),
@@ -321,6 +297,8 @@ class TaskService:
             state["parser"] = doc.get("parser", "")
             state["page_boundaries"] = doc.get("page_boundaries", [])
             state["warnings"] = list(doc.get("warnings") or [])
+            # 历史任务（曾支持多文件合并）的 document.json 里可能仍记着 files 列表，
+            # 续跑时沿用，避免老的页面图片/来源文件名丢失；新任务只有一个原件，走 uploaded_path。
             if doc.get("files"):
                 state["files"] = doc["files"]
             if doc.get("segments"):
@@ -750,5 +728,14 @@ class TaskService:
         self.store.write_json_atomic(self.store.task_status_path(task_id), status)
 
     # ------------------------------------------------------------ 运维
-    def cleanup_expired(self) -> int:
-        return self.store.cleanup_expired(self.settings.data_retention_hours)
+    def run_data_retention_cleanup(self) -> int:
+        """清理超过保留期的任务产物，返回被删除的条目数。
+
+        服务启动时与之后每小时各执行一次（见 app/main.py）；
+        running 任务由 FileStore 跳过，不会误删在途任务。
+        """
+
+        removed = self.store.cleanup_expired(self.settings.data_retention_hours)
+        if removed:
+            logger.info("数据保留期清理完成：已删除 %s 个条目", removed)
+        return removed

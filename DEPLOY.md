@@ -294,7 +294,7 @@ DOCMIND_DZ_OFFICE_CONCURRENCY=1      # soffice 单实例，必须串行
 | 改 nginx 配置 | 改 `deploy/nginx/docmind_dz.conf`，然后 `docker exec docmind-dz-gateway nginx -t && docker exec docmind-dz-gateway nginx -s reload` |
 | 升级 | `git pull && docker compose up -d --build`，**挑没人跑任务时**——重启会把在途任务标记为中断 |
 | 副本数 | **只跑一个副本、一个 uvicorn worker**，多开会互相把对方任务误判为中断 |
-| 数据位置 | `./data/tasks/<task_id>/`（原件、页面图、任务日志）、`./data/results/`；默认保留 168 小时自动清理 |
+| 数据位置 | `./data/tasks/<task_id>/`（原件、页面图、任务日志）、`./data/results/`；默认保留 24 小时（与托书识别一致），**启动时清一次、之后每小时清一次** |
 | 磁盘 | `df -h /data`；清理用 `rm -rf data/tasks/*`（属主是 10001，root 可删） |
 | 停止 | `docker compose down`（本项目的容器与网络，不影响 DocMind 等其它项目） |
 | 模型兜底 | 主模型整轮重试失败时自动切到兜底 provider。日志关键字：`兜底`、`熔断`。排查用 `grep -E "provider|熔断|兜底" logs/app.log` |
@@ -315,7 +315,7 @@ DOCMIND_DZ_OFFICE_CONCURRENCY=1      # soffice 单实例，必须串行
 | 改了 `.env` 没生效 | 少了 `--force-recreate` |
 | 改了 nginx 配置没生效 | 少了 `nginx -s reload` |
 | `/health` 里 `model_configured: false` | `DOCMIND_DZ_MODEL_API_KEY` 为空，或改了 `.env` 没 `--force-recreate`。容器不会崩，但任务一定失败 |
-| 上传多文件 413 | `client_max_body_size` 按单文件配了；应为 `MAX_UPLOAD_FILES × MAX_FILE_SIZE_MB`（默认 5×50MB → 256m） |
+| 上传大文件 413 | `client_max_body_size` 小于单文件上限；接口只收单个文件，按 `MAX_FILE_SIZE_MB`（默认 50MB）留余量即可（当前 256m） |
 | 任务大面积报"模型调用失败" | 主模型侧问题（限流 / 欠费 / 地域故障）。看日志有没有切换兜底；仍失败则检查兜底 Key 与配额 |
 | 进度条不动 | SSE 被缓冲 → 检查 `proxy_buffering off` 与 `proxy_read_timeout` |
 | DOC/XLS 没页面图，只有文字 | 镜像里 soffice 不可用，退化成纯文本解析 → `docker compose exec docmind-dz which soffice`、`soffice --version` |

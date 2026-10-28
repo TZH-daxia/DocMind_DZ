@@ -546,7 +546,7 @@ async function uploadFiles(input) {
   try {
     for (const file of batch) {
       try {
-        const snapshot = await api.createTask([file]);
+        const snapshot = await api.createTask(file);
         created.push(snapshot.task_id);
       } catch (error) {
         failed.push(`${file.name}：${error.message}`);

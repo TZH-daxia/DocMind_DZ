@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,7 @@ from app.api.dependencies import get_task_service
 from app.api.routes.analysis import router as analysis_router
 from app.config import Settings, _local_ipv4_addresses, get_settings
 from app.logging_config import LOG_FILE_NAME, configure_logging
+from app.service.task_service import TaskService
 
 logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
@@ -26,6 +27,9 @@ STATIC_DIR = Path(__file__).parent / "static"
 _STARTED_AT = time.perf_counter()
 # 进程启动时间由根目录 main.py 写入；直接 uvicorn app.main:app 启动时为空
 _PROCESS_STARTED_AT = float(os.environ.get("DOCMIND_DZ_PROCESS_STARTED_AT") or 0.0)
+
+# 周期清理间隔（小时）：与托书识别（DocMind）一致 —— 启动时先清一次，之后每小时一次
+DATA_CLEANUP_INTERVAL_HOURS = 1.0
 
 
 def _startup_elapsed() -> float:
@@ -50,6 +54,17 @@ def _display_hosts(host: str) -> list[str]:
         if address not in hosts:
             hosts.append(address)
     return hosts
+
+
+async def _periodic_data_cleanup(service: TaskService, interval_hours: float) -> None:
+    """周期清理超过保留期的任务产物；单次失败只记日志，不影响服务。"""
+
+    while True:
+        await asyncio.sleep(interval_hours * 3600)
+        try:
+            await asyncio.to_thread(service.run_data_retention_cleanup)
+        except Exception:
+            logger.exception("周期清理任务产物失败")
 
 
 def format_startup_banner(current: Settings) -> str:
@@ -108,10 +123,22 @@ async def lifespan(app: FastAPI):
             _startup_elapsed(),
         )
     _echo(format_startup_banner(settings))
-    asyncio.create_task(asyncio.to_thread(service.cleanup_expired))
+    # 启动先清一次过期产物；之后由周期任务每小时清一次（与托书识别一致）
+    try:
+        removed = await asyncio.to_thread(service.run_data_retention_cleanup)
+        if removed:
+            logger.info("启动清理：删除 %s 个过期条目", removed)
+    except Exception:
+        logger.exception("启动清理任务产物失败")
+    cleanup_task = asyncio.create_task(
+        _periodic_data_cleanup(service, DATA_CLEANUP_INTERVAL_HOURS)
+    )
     try:
         yield
     finally:
+        cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup_task
         _echo(f"{settings.app_name} 已停止")
 
 

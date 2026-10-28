@@ -126,51 +126,6 @@ async def test_master_only_file_skips_extract_and_verify_nodes(settings, tmp_pat
     assert "核对分单与舱单" not in started
 
 
-async def test_pipeline_accepts_house_pdf_with_manifest_xlsx(settings, tmp_path):
-    from openpyxl import Workbook
-
-    pdf = write_pdf(
-        tmp_path / "house.pdf", [house_page("HAWB0001"), house_page("HAWB0002")]
-    )
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "MANIFEST"
-    sheet.append(["CARGO MANIFEST"])
-    sheet.append(["HAWB NO.", "ORIGIN", "DEST", "PCS"])
-    sheet.append(["HAWB0001", "PVG", "LAX", "12"])
-    xlsx = tmp_path / "manifest.xlsx"
-    workbook.save(xlsx)
-
-    service = make_service(settings)
-    snapshot = service.create_task(
-        [
-            UploadedDocument(filename="house.pdf", content=pdf.read_bytes()),
-            UploadedDocument(filename="manifest.xlsx", content=xlsx.read_bytes()),
-        ]
-    )
-    await _run_task(service, snapshot.task_id)
-
-    snapshot = service.get_snapshot(snapshot.task_id)
-    assert snapshot.status == "succeeded", snapshot.error
-    result = service.get_result(snapshot.task_id)
-    assert result["page_count"] == 3
-    assert [page["source_file"] for page in result["pages"]] == [
-        "house.pdf",
-        "house.pdf",
-        "manifest.xlsx",
-    ]
-    assert len(result["house_bills"]) == 2
-    assert result["manifest"] is not None
-    assert result["manifest"]["entries"]
-
-
-def test_create_task_rejects_empty_upload_list(settings):
-    service = make_service(settings)
-    with pytest.raises(TaskError) as excinfo:
-        service.create_task([])
-    assert excinfo.value.code == "FILE_EMPTY"
-
-
 def test_reject_unsupported_extension(settings):
     service = make_service(settings)
     with pytest.raises(TaskError) as excinfo:
