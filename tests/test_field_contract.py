@@ -48,8 +48,8 @@ def _template_keys() -> set[str]:
 
 
 def test_backend_house_field_count() -> None:
-    assert len(HOUSE_FIELD_KEYS) == 36
-    assert len(set(HOUSE_FIELD_KEYS)) == 36
+    assert len(HOUSE_FIELD_KEYS) == 37
+    assert len(set(HOUSE_FIELD_KEYS)) == 37
     # 件数/重量/体积只保留制单口径；By First Carrier 不再抽取
     for removed in ("pieces", "weight", "volume", "first_carrier_code"):
         assert removed not in HOUSE_FIELD_KEYS
@@ -58,7 +58,7 @@ def test_backend_house_field_count() -> None:
 
 def test_frontend_default_fields_match_backend() -> None:
     keys = _default_house_keys()
-    assert len(keys) == len(HOUSE_FIELD_KEYS) == 36
+    assert len(keys) == len(HOUSE_FIELD_KEYS) == 37
     assert set(keys) == set(HOUSE_FIELD_KEYS)
 
 
@@ -73,9 +73,9 @@ def test_house_required_fields_are_all_but_party() -> None:
     required = [
         spec for spec in HOUSE_FIELD_SPECS if spec.group not in {"shipper", "consignee"}
     ]
-    assert len(required) == 16
+    assert len(required) == 17
     keys = {spec.key for spec in required}
-    assert {"hawb", "currency", "declarecustom", "handlinginfo", "zdvolume", "pm"} <= keys
+    assert {"mawb", "hawb", "currency", "declarecustom", "handlinginfo", "zdvolume", "pm"} <= keys
     assert not any(key.endswith(("_fhr_hawb", "_shr_hawb")) for key in keys)
 
 

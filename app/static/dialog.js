@@ -339,7 +339,7 @@ function renderHouseInfo(tab, comparison) {
       : null;
   // 不再展示分单号与页码：置信度占据原分单号的位置，字号与标记保持一致
   const confidence = Math.round((tab.bill.confidence || 0) * 100);
-  return `<div class="awb-row-info" style="--col:1;--span:8">
+  return `<div class="awb-row-info" style="--col:1;--span:4">
       <div class="awb-info-head">
         <span class="awb-info-no">置信度 ${confidence}%</span>
         ${statusInfo ? statusPill(statusInfo.label, statusInfo.className) : ""}

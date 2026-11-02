@@ -2,7 +2,7 @@
 
 两套字段目录：
 - `HOUSE_FIELD_SPECS`：分单（HAWB）单证模板字段，按 AWB 版面分组：
-  运输 6、发货人 10、收货人 10、申报 2、制单/货物 8，共 36 项。
+  运输 7、发货人 10、收货人 10、申报 2、制单/货物 8，共 37 项。
   件数/重量/体积只有制单口径（zdpiece/zdweight/zdvolume），不再重复抽取；
   By First Carrier（航班二字码）不抽，航班只保留 hbh（Flight No.）。
 - `MANIFEST_FIELD_SPECS`：舱单只保留核对字段（分单号 + 目的港 + 件数/重量/计费重/体积）。
@@ -103,6 +103,8 @@ def _party_specs(group: str) -> tuple[FieldSpec, ...]:
 # ---- 分单模板字段（AWB 版面） ---------------------------------------------
 # key 与《接口字段对照表》的「单证」列一一对应（sfg/mdg/hbh/hbrq…）
 SHIPMENT_TEMPLATE_SPECS: tuple[FieldSpec, ...] = (
+    # 主单号：与分单号同在 AWB 顶部左右两侧，入库时要一并带给 ERP
+    FieldSpec("mawb", "主单号（MAWB No.）", "shipment", "text"),
     FieldSpec("hawb", "分单号", "shipment", "text"),
     FieldSpec("sfg", "始发港", "shipment", "port"),
     FieldSpec("mdg", "目的港", "shipment", "port"),

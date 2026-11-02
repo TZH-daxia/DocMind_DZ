@@ -54,8 +54,9 @@ export const PARTY_GROUP_LABEL = {
   consignee: "CONSIGNEE'S NAME AND ADDRESS",
 };
 
-// 分单字段（与后端 HOUSE_FIELD_SPECS 一致，36 项；key 为接口字段名）
+// 分单字段（与后端 HOUSE_FIELD_SPECS 一致，37 项；key 为接口字段名）
 export const DEFAULT_HOUSE_FIELDS = [
+  ["mawb", "主单号", "shipment"],
   ["hawb", "分单号", "shipment"],
   ["sfg", "始发港", "shipment"],
   ["mdg", "目的港", "shipment"],
@@ -140,8 +141,15 @@ const PARTY_TEMPLATE_FIELDS = [
 ];
 
 export const HOUSE_TEMPLATE = [
-  // 右上：HAWB No.；左侧空白放单据摘要信息
-  { id: "hawb", info: true, fields: [{ key: "hawb", col: 9, span: 4, label: "HAWB No." }] },
+  // 顶部一行三等分：左 状态块 · 中 主单号（MAWB No.）· 右 分单号（HAWB No.）
+  {
+    id: "hawb",
+    info: true,
+    fields: [
+      { key: "mawb", col: 5, span: 4, label: "MAWB No." },
+      { key: "hawb", col: 9, span: 4, label: "HAWB No." },
+    ],
+  },
   // 当事人整行：名称 / 地址（多行）/ 城市 + 国家 + 电话 + 邮箱
   { id: "shipper", party: "shipper", col: 1, span: 12, fields: PARTY_TEMPLATE_FIELDS },
   { id: "consignee", party: "consignee", col: 1, span: 12, fields: PARTY_TEMPLATE_FIELDS },

@@ -4,11 +4,12 @@
 
 ## 输出字段
 
-### 一、分单与运输信息（6 项）
+### 一、分单与运输信息（7 项）
 
 | 键 | 版式栏位 | 抽取要求 |
 |---|---|---|
-| hawb | 右上 HAWB No. | 取 HAWB No. / House Air Waybill No.；去掉空格与连字符两侧空白，统一大写；**不要取主单号（MAWB）** |
+| mawb | 左上角主单号（MAWB No.） | AWB 左上角那串就是主单号，常见两种写法：`416PVG52331591`（3 位航司前缀 + 机场三字码 + 8 位序号）和 `369 TSN 10799445`（带空格的同一含义）。**统一输出 `前缀-序号`**：`416-52331591`、`369-10799445`（去掉中间的机场三字码）。凡是「3 位数字 +（可选）3 个字母 + 8 位数字」的串都判为主单号，**不要因为中间夹着机场码就置空**；右上角 `HAWB No.` 才是分单号（如 EDC2037060、1077968462），两者不得混用 |
+| hawb | 右上 HAWB No. | 取 HAWB No. / House Air Waybill No.；去掉空格与连字符两侧空白，统一大写；**不要取主单号（主单号填 mawb）** |
 | sfg | Airport of Departure | **只输出 IATA 三字码**（如 PVG、LAX）；原文写城市名/机场全称时转换成对应三字码（如 `SHANGHAI PUDONG`→PVG、`GUADALAJARA`→GDL）；原文是国家/地区/多机场城市（如 GERMANY、SHANGHAI）确实无法确定具体机场时，value=null、status=`needs_review`，原文写进 `evidence` |
 | mdg | Airport of Destination | **只输出 IATA 三字码**（如 LAX、GDL）；原文写城市名/机场全称时转换成对应三字码；确定不了具体机场时 value=null、status=`needs_review`，原文写进 `evidence` |
 | hbh | Flight No. / Requested Flight 前半段 | 完整航班号，格式为 2 位航司代码 + 数字（如 N8652），去掉空格与连字符；**不要拆出 By First Carrier 的二字码** |
@@ -69,7 +70,7 @@
 
 ## 严格规则
 
-1. **只抽本页分单**。不得把主单号当分单号，不得把其他分单或舱单的数据混入。
+1. **只抽本页分单**。主单号只填 `mawb`（并统一成 `416-52331591` 这种「前缀-序号」写法，丢掉中间的机场三字码），不得当分单号（`hawb`），不得把其他分单或舱单的数据混入。
 2. **不猜测、不推断、不补全**。页面没有的字段填 `null`；宁可 null 也不要编造。城市、州名、邮编只能来自页面线索（地址中的城市名、州/省名、邮编等），不要凭常识补全。
 3. 收发货人只取 Shipper / Consignee 栏。**Notify Party、Agent、Issuing Carrier's Agent 不是收发货人**，不要把它们的名称、地址、电话混入。
 4. 名称保留原文大小写与语言，不要翻译。**地址保留原文**（一般 1–2 行，原文写在同一行的城市也一并保留）；城市、州/省、邮编、国家二字码通常位于地址下方同一行，分别填入 `city_*` / `state_*` / `postcode_*` / `companycode_*`；**中国地址没有州/省，`state_*` 填 null**；国家只填 2 位代码（`companycode_*`，如 China→CN、United States→US），不要写全称、也不要塞进地址。
@@ -95,6 +96,7 @@
 ```json
 {
   "fields": {
+    "mawb": "416-52331591",
     "hawb": "EDC2037060",
     "sfg": "PVG",
     "mdg": "DFW",

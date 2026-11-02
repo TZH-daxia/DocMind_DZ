@@ -130,6 +130,31 @@ def normalize_doc_no(value: str | None) -> str:
     return re.sub(r"[^0-9A-Z]", "", basic_normalize(value))
 
 
+# 主单号：3 位航司前缀 + 可选的机场三字码 + 8 位序号
+_MAWB_IATA = re.compile(r"^(\d{3})-?(?:[A-Z]{3})?-?(\d{8})$")
+
+
+def normalize_mawb(value: str | None) -> str | None:
+    """主单号统一成 `416-52331591`。
+
+    AWB 左上角那串的写法不固定，本质都是「3 位航司前缀 + 8 位序号」，
+    中间常夹一个机场/城市三字码：
+
+        416PVG52331591  /  416 TSN 10799445  /  416-52331591
+
+    分单号（EDC2037060 / 1077968462）不符合这个形状，因此不会被误归一。
+    认不出来时返回 None，由调用方保留原值或留在待审核里。
+    """
+
+    compact = re.sub(r"[^0-9A-Z]", "", basic_normalize(value))
+    if not compact:
+        return None
+    match = _MAWB_IATA.match(compact)
+    if not match:
+        return None
+    return f"{match.group(1)}-{match.group(2)}"
+
+
 def normalize_email(value: str | None) -> str:
     normalized = basic_normalize(value).lower()
     return re.sub(r"^MAILTO:", "", normalized).strip()

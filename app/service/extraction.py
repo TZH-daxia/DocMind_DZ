@@ -34,7 +34,7 @@ from app.schemas.fields import (
     PARTY_INTERFACE_KEYS,
     flatten_party_fields,
 )
-from app.service.normalizers import normalize_phone
+from app.service.normalizers import normalize_mawb, normalize_phone
 from app.service.ports import normalize_port_fields
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,8 @@ MAX_PAGE_CHARS = 12000
 # 标准键保持「舱单 / 核对口径」；分单接口名（mdg/zdpiece…）作为别名，
 # 分单归一化时再统一改写成接口字段名，避免舱单字段被分单命名吃掉。
 FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    # 主单号：分单接口名就叫 mawb，模型也可能写成 master_awb / 主单号
+    "mawb": ("mawb_no", "master_awb", "master_air_waybill_no", "master_bill_no", "主单号"),
     "hawb_no": ("hawb", "hawbno", "hawb_number", "house_no", "house_bill_no", "分单号"),
     "sfg": ("origin_port", "origin", "pol", "origin_airport", "始发港", "起运港"),
     "dest_port": ("mdg", "destination", "dest", "pod", "destination_airport", "目的港"),
@@ -409,6 +411,14 @@ def _normalize_house_bill_payload(payload: dict[str, Any]) -> dict[str, Any]:
         phone_key = PARTY_INTERFACE_KEYS[party]["phone"]
         if fields.get(phone_key):
             fields[phone_key] = normalize_phone(fields[phone_key]) or None
+
+    # 主单号：AWB 左上角常写成「前缀 + 机场三字码 + 序号」（416PVG52331591），
+    # 模型容易把它当成非主单号而置空 —— 这里统一归一成 416-52331591；
+    # 值为空时再回退到 evidence 里引用的原文（模型有时把值只写进 quote）。
+    mawb_meta = _candidate_meta(payload.get("evidence")).get("mawb") or {}
+    mawb = normalize_mawb(fields.get("mawb")) or normalize_mawb(mawb_meta.get("quote"))
+    if mawb:
+        fields["mawb"] = mawb
     warnings = _to_warnings(payload.get("warnings"))
     missing = [key for key in CORE_HOUSE_KEYS if not fields.get(key)]
     if missing:
