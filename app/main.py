@@ -193,6 +193,8 @@ def create_app() -> FastAPI:
         allow_origin_regex=settings.cors_origin_regex,
         allow_methods=["*"],
         allow_headers=["*"],
+        # 原件下载接口把文件名放在 Content-Disposition 里，浏览器要能读到它
+        expose_headers=["Content-Disposition"],
     )
     app.include_router(analysis_router, prefix=settings.api_prefix)
 

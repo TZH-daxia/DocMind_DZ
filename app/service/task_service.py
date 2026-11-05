@@ -49,6 +49,31 @@ class TaskNotFoundError(TaskError):
         super().__init__("TASK_NOT_FOUND", f"任务不存在：{task_id}", http_status=404)
 
 
+def _per_mille(value: float) -> int:
+    """归一化坐标（0~1）→ 千分比整数；越界值裁剪到区间内。"""
+
+    return int(round(min(max(value, 0.0), 1.0) * 1000))
+
+
+def _parse_location_box(box: dict[str, Any], indexes: list[int]) -> list[int] | None:
+    """一个高亮框 → `[相对页序, x, y, w, h]`（千分比整数）；数据异常返回 None。
+
+    页号不在该分单的页列表里时退化到第一页：宁可框偏一点，也别整份分单没有高亮。
+    """
+
+    if not isinstance(box, dict):
+        return None
+    try:
+        page = int(box.get("page") or 0)
+        bbox = [float(value) for value in (box.get("bbox") or [])][:4]
+    except (TypeError, ValueError):
+        return None
+    if len(bbox) < 4:
+        return None
+    relative = indexes.index(page) + 1 if page in indexes else 1
+    return [relative] + [_per_mille(value) for value in bbox]
+
+
 class TaskReporter:
     """节点进度回调（注入 LangGraph state，不落盘）。"""
 
@@ -556,6 +581,67 @@ class TaskService:
         if index is None:
             return {"enabled": False, "items": []}
         return {"enabled": True, "items": index.search(keyword)}
+
+    def house_bill_locations(self, task_id: str) -> dict[str, Any]:
+        """每份分单的字段坐标（精简结构，供 ERP 入库后做高亮）。
+
+        与 `/result` 的区别：
+        - 只留坐标，去掉 text / zoom_text / fields / comparisons 等大字段（一份分单约 1 KB）；
+        - 坐标换算成**相对该分单的页序**（在 `page_indexes` 里排第几，1 起），
+          这样 ERP 归档的页面图按 `id` 升序就能直接对上；
+        - 归一化坐标转成 0~1000 的整数（千分比），前端除以 1000 即可还原，体积更小。
+        """
+
+        result = self.get_result(task_id)
+        bills: list[dict[str, Any]] = []
+
+        for bill in result.get("house_bills") or []:
+            indexes = [int(value) for value in (bill.get("page_indexes") or [])]
+            locations: dict[str, Any] = {}
+
+            for key, boxes in (bill.get("field_locations") or {}).items():
+                items: list[list[int]] = []
+                for box in boxes or []:
+                    parsed = _parse_location_box(box, indexes)
+                    if parsed is not None:
+                        items.append(parsed)
+                if items:
+                    locations[str(key)] = items
+
+            if not locations:
+                continue
+
+            bills.append(
+                {
+                    "id": str(bill.get("bill_id") or ""),
+                    "off": indexes[0] if indexes else None,
+                    "loc": locations,
+                }
+            )
+
+        return {"schema_version": 1, "task_id": task_id, "bills": bills}
+
+    def source_document(self, task_id: str) -> tuple[Path, str]:
+        """用户上传的原件（PDF / 图片 / Office）及其原始文件名。
+
+        路径以任务状态里的 `uploaded_path` 为唯一权威来源（创建任务时写入），
+        这里不再按目录猜文件名。产物被 24h 清理后返回 404，由前端决定是否降级。
+        """
+
+        status = self._read_status(task_id)
+        raw = str(status.get("uploaded_path") or "").strip()
+        name = str(status.get("source_name") or "").strip()
+
+        if raw:
+            path = Path(raw)
+            if path.exists():
+                return path, name or path.name
+
+        raise TaskError(
+            "SOURCE_FILE_NOT_FOUND",
+            "上传的原件不存在（可能已被清理）",
+            http_status=404,
+        )
 
     def page_image(self, task_id: str, index: int) -> Path:
         self._read_status(task_id)

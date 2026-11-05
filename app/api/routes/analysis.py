@@ -168,6 +168,41 @@ async def get_page_image(
     return FileResponse(path, media_type="image/png")
 
 
+@router.get("/tasks/{task_id}/locations", summary="字段坐标（精简）")
+async def get_house_bill_locations(
+    task_id: str,
+    service: TaskService = Depends(get_task_service),
+) -> dict[str, Any]:
+    """每份分单的字段高亮坐标，供 ERP 入库后做「点明细看原文」用。
+
+    只含必要内容（约 1 KB/分单）：`bills[].loc[字段] = [[相对页序, x, y, w, h]]`，
+    坐标是归一化值的千分比整数，正文/字段值/差异都留在 `/result` 里不给。
+    """
+
+    try:
+        return service.house_bill_locations(task_id)
+    except TaskError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/tasks/{task_id}/file", summary="上传的原件")
+async def get_source_file(
+    task_id: str,
+    service: TaskService = Depends(get_task_service),
+) -> FileResponse:
+    """返回用户上传的原始文件（PDF / 图片 / Office），文件名沿用原名。
+
+    用途：ERP 侧要把原件归档到自己的附件服务（页面图走 `/pages/{index}`），
+    这里按字节原样返回，前端 fetch 成 Blob 后即可转存。
+    """
+
+    try:
+        path, filename = service.source_document(task_id)
+    except TaskError as exc:
+        raise _http_error(exc) from exc
+    return FileResponse(path, media_type="application/octet-stream", filename=filename)
+
+
 @router.get("/tasks/{task_id}/submission", summary="已提交结果")
 async def get_submission(
     task_id: str, service: TaskService = Depends(get_task_service)
