@@ -3,10 +3,10 @@
 # 构建：docker compose build
 # 运行：docker compose up -d
 #
-# uv.lock 里记录的索引是 pypi.org（官方源）。国内服务器拉依赖慢时显式换源：
-#   docker compose build \
-#     --build-arg UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
-#     --build-arg APT_MIRROR=mirrors.aliyun.com
+# 国内服务器务必换源，否则默认源（deb.debian.org / pypi.org）实测只有 ~17KB/s，
+# 光 apt 那一层就要几小时。在 .env 里写（compose 会作为 build args 传入）：
+#   APT_MIRROR=mirrors.aliyun.com
+#   UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 # -------------------------------
 # 1) 依赖阶段：用 uv 生成独立 venv
@@ -60,11 +60,20 @@ ENV PYTHONUNBUFFERED=1 \
 #   任务能跑，但没有页面预览图，线上表现与开发机不一致。
 # 中文字体：转 PDF 与页面光栅化都依赖系统中文字体，缺失会渲染成方块。
 ARG APT_MIRROR=""
-RUN set -eu; \
+
+# 缓存挂载 + 换源的两点说明：
+#   1) apt 索引与已下载的 .deb 存在 BuildKit 缓存里（不进镜像层），中断/重建可复用 ——
+#      默认源实测只有 ~17KB/s，一次 apt-get update 就要 11 分钟，白下很伤；
+#      也正因为索引在缓存里，末尾不再 rm 掉 /var/lib/apt/lists（镜像不会因此变大）。
+#   2) 换源时把 http 一并提升为 https：部分机房对 80 端口限速，https 才跑得动。
+#      实测 deb.debian.org（Fastly, :80）约 17KB/s，阿里云 https 源可达数 MB/s。
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    set -eu; \
     if [ -n "$APT_MIRROR" ]; then \
         for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
             if [ -f "$f" ]; then \
-                sed -i "s|deb.debian.org|$APT_MIRROR|g; s|security.debian.org|$APT_MIRROR|g" "$f"; \
+                sed -i "s#http://deb.debian.org#https://$APT_MIRROR#g; s#http://security.debian.org#https://$APT_MIRROR#g; s#https://deb.debian.org#https://$APT_MIRROR#g; s#https://security.debian.org#https://$APT_MIRROR#g" "$f"; \
             fi; \
         done; \
     fi; \
@@ -80,8 +89,7 @@ RUN set -eu; \
         ca-certificates \
         tzdata; \
     sed -i 's/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen; \
-    locale-gen; \
-    rm -rf /var/lib/apt/lists/*
+    locale-gen
 
 # 单证里普遍指定「宋体 / 仿宋 / 微软雅黑」等 Windows 字体，镜像内没有时 fontconfig
 # 会退化到 DejaVu Sans 排版：拉丁度量比宋体宽，同样内容换行变多、纵向溢出，

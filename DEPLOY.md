@@ -125,9 +125,11 @@ DOCMIND_DZ_CORS_ALLOW_ORIGINS=
 # ===== 对外端口（改动后访问地址要跟着带新端口）=====
 DOCMIND_DZ_HTTPS_PORT=8444
 
-# ===== 构建加速（可选）=====
-# APT_MIRROR=mirrors.aliyun.com
-# UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# ===== 构建加速（国内服务器强烈建议打开）=====
+# 默认源实测只有 ~17KB/s（deb.debian.org 走 Fastly:80），apt 层要几小时；
+# 换源后首次构建 3~5 分钟。境外服务器注释掉这两行。
+APT_MIRROR=mirrors.aliyun.com
+UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 **不要改的项**（compose 会在容器内覆盖，改了也不生效，容易误判）：
