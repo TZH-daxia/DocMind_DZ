@@ -100,7 +100,6 @@ const COMPARISON_KEY_ALIASES = {
   mdg: "dest_port",
   zdpiece: "pieces",
   zdweight: "weight",
-  jfweight: "chargeable_weight",
   zdvolume: "volume",
 };
 const HOUSE_KEY_ALIASES = Object.fromEntries(

@@ -11,6 +11,8 @@ class AnalysisState(TypedDict, total=False):
     task_id: str
     uploaded_path: str
     files: list[dict[str, Any]]
+    # 识别方式：single=单票（多文件同一主单）；batch=批量（一文件一任务）
+    mode: str
     source_name: str
     context: dict[str, Any]
     reporter: Any

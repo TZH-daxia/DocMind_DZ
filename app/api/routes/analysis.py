@@ -40,13 +40,38 @@ async def search_ports(
 
 @router.post("/tasks", summary="上传单证并创建分析任务")
 async def create_task(
-    file: UploadFile = File(..., description="单证文件（PDF / Word / Excel）"),
+    files: list[UploadFile] | None = File(
+        default=None, description="单票：同一主单的多个文件（最多 5 个）"
+    ),
+    file: UploadFile | None = File(
+        default=None, description="兼容单文件上传（批量模式）"
+    ),
+    mode: str = Form(default="batch", description="single=单票，batch=批量"),
     context: str | None = Form(
         default=None, description="附加上下文，JSON 字符串（可选）"
     ),
     service: TaskService = Depends(get_task_service),
 ) -> dict[str, Any]:
-    """一个文件一个任务：多个文件请分多次上传，各自独立分析。"""
+    """创建识别任务。
+
+    - `single`（单票）：多个文件合成**一个任务**，必须属于同一个主单，
+      识别出多个主单时任务失败；
+    - `batch`（批量）：一个文件一个任务（原逻辑），因此一次只接受一个文件。
+    """
+
+    targets = list(files or [])
+    if file is not None:
+        targets.append(file)
+    if not targets:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "FILE_REQUIRED", "message": "请上传至少一个文件"},
+        )
+    if len(targets) > 5:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "TOO_MANY_FILES", "message": "一次最多上传 5 个文件"},
+        )
 
     parsed_context: dict[str, Any] = {}
     if context:
@@ -59,13 +84,16 @@ async def create_task(
                 detail={"code": "CONTEXT_INVALID", "message": "context 必须是合法 JSON"},
             ) from None
 
-    upload = UploadedDocument(
-        filename=file.filename or "document",
-        content=await file.read(),
-        content_type=file.content_type,
-    )
+    uploads = [
+        UploadedDocument(
+            filename=item.filename or "document",
+            content=await item.read(),
+            content_type=item.content_type,
+        )
+        for item in targets
+    ]
     try:
-        snapshot = service.create_and_start(upload, parsed_context)
+        snapshot = service.create_and_start(uploads, parsed_context, mode=mode)
     except TaskError as exc:
         raise _http_error(exc) from exc
     return snapshot.model_dump(mode="json")
@@ -185,15 +213,55 @@ async def get_house_bill_locations(
         raise _http_error(exc) from exc
 
 
-@router.get("/tasks/{task_id}/file", summary="上传的原件")
+@router.get("/tasks/{task_id}/files", summary="上传的原件清单")
+async def list_source_files(
+    task_id: str,
+    service: TaskService = Depends(get_task_service),
+) -> list[dict[str, Any]]:
+    """单票可能上传多个原件：先列清单，再按 index 逐个下载。
+
+    批量模式只有一个元素，调用方可以统一按清单处理，不必区分模式。
+    """
+
+    try:
+        items = service.source_documents(task_id)
+    except TaskError as exc:
+        raise _http_error(exc) from exc
+    return [
+        {"index": index, "name": name, "size": path.stat().st_size}
+        for index, (path, name) in enumerate(items, start=1)
+    ]
+
+
+@router.get("/tasks/{task_id}/files/{index}", summary="按序号下载原件")
+async def get_source_file_by_index(
+    task_id: str,
+    index: int,
+    service: TaskService = Depends(get_task_service),
+) -> FileResponse:
+    """按清单里的 index（1 起）下载对应原件，文件名沿用原名。"""
+
+    try:
+        items = service.source_documents(task_id)
+    except TaskError as exc:
+        raise _http_error(exc) from exc
+    if index < 1 or index > len(items):
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "SOURCE_FILE_NOT_FOUND", "message": f"第 {index} 个原件不存在"},
+        )
+    path, filename = items[index - 1]
+    return FileResponse(path, media_type="application/octet-stream", filename=filename)
+
+
+@router.get("/tasks/{task_id}/file", summary="上传的原件（第一个）")
 async def get_source_file(
     task_id: str,
     service: TaskService = Depends(get_task_service),
 ) -> FileResponse:
-    """返回用户上传的原始文件（PDF / 图片 / Office），文件名沿用原名。
+    """兼容接口：返回**第一个**原件。
 
-    用途：ERP 侧要把原件归档到自己的附件服务（页面图走 `/pages/{index}`），
-    这里按字节原样返回，前端 fetch 成 Blob 后即可转存。
+    单票多文件的调用方请改用 `/files` + `/files/{index}`，否则只能拿到第一份。
     """
 
     try:

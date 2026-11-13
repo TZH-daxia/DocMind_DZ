@@ -36,7 +36,8 @@ export const NODES = [
   "识别主单/分单/舱单",
   // 只对分单页做四象限放大转写；没有分单时图会跳过该节点
   "分单局部精读",
-  "抽取分单与舱单字段",
+  // 有舱单时只抽舱单（行转分单），没有舱单才抽分单页
+  "抽取分单或舱单字段",
   "核对分单与舱单",
   "生成结果",
 ];
@@ -83,26 +84,48 @@ export const DEFAULT_HOUSE_FIELDS = [
   ["phone_shr_hawb", "收货人手机号", "consignee"],
   ["email_shr_hawb", "收货人邮箱", "consignee"],
   ["fax_shr_hawb", "收货人传真", "consignee"],
-  ["declarecustom", "申报价值（Declared Value for Customs）", "declaration"],
   ["handlinginfo", "操作信息（Handling Information）", "declaration"],
   ["zdpiece", "制单件数（No. of Pieces RCP）", "cargo"],
   ["zdweight", "制单重量（Gross Weight）", "cargo"],
   ["ratelevel", "运价类别（Rate Class）", "cargo"],
-  ["jfweight", "计费重量（Chargeable Weight）", "cargo"],
   ["rate", "单价（Rate/Charge）", "cargo"],
   ["ratetotal", "总价（Rate/Total）", "cargo"],
   ["zdvolume", "制单体积（Volume）", "cargo"],
   ["pm", "品名（Nature and Quantity of Goods）", "cargo"],
 ].map(([key, label, group]) => ({ key, label, group }));
 
-// 舱单只抽取核对字段：分单号 + 目的港 + 制单件数/重量/计费重/体积
+// 舱单字段：每行一份分单概要，与分单同构（收发货人各 10 项）
 export const DEFAULT_MANIFEST_FIELDS = [
+  ["mawb", "主单号（MAWB No.）", "shipment"],
   ["hawb_no", "分单号", "shipment"],
+  ["sfg", "始发港", "shipment"],
   ["dest_port", "目的港", "shipment"],
-  ["pieces", "件数", "shipment"],
-  ["weight", "重量", "shipment"],
-  ["chargeable_weight", "计费重量", "cargo"],
-  ["volume", "体积", "shipment"],
+  ["hbh", "航班号", "shipment"],
+  ["hbrq", "航班日期", "shipment"],
+  ["companytitle_fhr_hawb", "发货人名称", "shipper"],
+  ["address_fhr_hawb", "发货人地址", "shipper"],
+  ["city_fhr_hawb", "发货人城市名称", "shipper"],
+  ["postcode_fhr_hawb", "发货人邮编", "shipper"],
+  ["companycode_fhr_hawb", "发货人国家二字码", "shipper"],
+  ["state_fhr_hawb", "发货人州名", "shipper"],
+  ["lxr_fhr_hawb", "发货人联系人", "shipper"],
+  ["phone_fhr_hawb", "发货人手机号", "shipper"],
+  ["email_fhr_hawb", "发货人邮箱", "shipper"],
+  ["fax_fhr_hawb", "发货人传真", "shipper"],
+  ["companytitle_shr_hawb", "收货人名称", "consignee"],
+  ["address_shr_hawb", "收货人地址", "consignee"],
+  ["city_shr_hawb", "收货人城市名称", "consignee"],
+  ["postcode_shr_hawb", "收货人邮编", "consignee"],
+  ["companycode_shr_hawb", "收货人国家二字码", "consignee"],
+  ["state_shr_hawb", "收货人州名", "consignee"],
+  ["lxr_shr_hawb", "收货人联系人", "consignee"],
+  ["phone_shr_hawb", "收货人手机号", "consignee"],
+  ["email_shr_hawb", "收货人邮箱", "consignee"],
+  ["fax_shr_hawb", "收货人传真", "consignee"],
+  ["pieces", "件数", "cargo"],
+  ["weight", "重量", "cargo"],
+  ["volume", "体积", "cargo"],
+  ["pm", "品名（Nature and Quantity of Goods）", "cargo"],
 ].map(([key, label, group]) => ({ key, label, group }));
 
 // 参与人字段 → 接口字段名：shipper → *_fhr_hawb，consignee → *_shr_hawb
@@ -153,18 +176,12 @@ export const HOUSE_TEMPLATE = [
   // 当事人整行：名称 / 地址（多行）/ 城市 + 国家 + 电话 + 邮箱
   { id: "shipper", party: "shipper", col: 1, span: 12, fields: PARTY_TEMPLATE_FIELDS },
   { id: "consignee", party: "consignee", col: 1, span: 12, fields: PARTY_TEMPLATE_FIELDS },
-  // 运输与申报：Airport of Departure 右侧依次是 Currency / Declared Value（不再抽 By First Carrier）
+  // 运输：Airport of Departure + Currency（不再抽 By First Carrier / Declared Value）
   {
     id: "routing",
     fields: [
       { key: "sfg", col: 1, span: 4, label: "Airport of Departure" },
       { key: "currency", col: 5, span: 3, label: "Currency" },
-      {
-        key: "declarecustom",
-        col: 8,
-        span: 5,
-        label: "Declared Value for Customs",
-      },
     ],
   },
   // Airport of Destination + Requested Flight/Date，整行三等分
@@ -183,14 +200,13 @@ export const HOUSE_TEMPLATE = [
       { key: "handlinginfo", col: 1, span: 12, label: "Handling Information", textarea: true },
     ],
   },
-  // 货物表两排、每排 4 个：第一排 件数 / 毛重 / 运价 / 计费重
+  // 货物表两排：第一排 件数 / 毛重 / 运价类别（计费重不再抽取）
   {
     id: "cargo",
     fields: [
-      { key: "zdpiece", col: 1, span: 3, label: "No. of Pieces RCP" },
-      { key: "zdweight", col: 4, span: 3, label: "Gross Weight" },
-      { key: "ratelevel", col: 7, span: 3, label: "Rate Class" },
-      { key: "jfweight", col: 10, span: 3, label: "Chargeable Weight" },
+      { key: "zdpiece", col: 1, span: 4, label: "No. of Pieces RCP" },
+      { key: "zdweight", col: 5, span: 4, label: "Gross Weight" },
+      { key: "ratelevel", col: 9, span: 4, label: "Rate Class" },
     ],
   },
   // 第二排 单价 / 总价 / 体积 / 品名（品名占半行，保证长名称能完整显示）
@@ -210,16 +226,20 @@ export const HOUSE_TEMPLATE = [
   },
 ];
 
-export const MANIFEST_GROUPS = ["shipment", "cargo"];
+export const MANIFEST_GROUPS = ["shipment", "shipper", "consignee", "cargo"];
 
-// 舱单页签字段名沿用舱单表格里的英文表头
+// 舱单页签字段名沿用表格里的英文表头
 export const MANIFEST_LABELS_EN = {
+  mawb: "MAWB No.",
   hawb_no: "HAWB No.",
-  dest_port: "Destination",
+  sfg: "Airport of Departure",
+  dest_port: "Airport of Destination",
+  hbh: "Flight No.",
+  hbrq: "Flight Date",
   pieces: "Pieces",
-  weight: "Weight",
-  chargeable_weight: "Chargeable Weight",
+  weight: "Gross Weight",
   volume: "Volume",
+  pm: "Nature and Quantity of Goods",
 };
 
 // 单证上需要人工填写、不参与识别的栏位（当前全部改为自动抽取）

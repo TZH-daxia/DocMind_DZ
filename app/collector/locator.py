@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 from datetime import date
@@ -75,8 +76,6 @@ COUNTRY_NAME_ALIASES: dict[str, tuple[str, ...]] = {
 # 版式栏位名 → 分单字段；用于把搜索限制在该栏附近
 FIELD_LABEL_HINTS: dict[str, tuple[str, ...]] = {
     "hawb": ("HAWB NO", "HOUSE AIR WAYBILL NO"),
-    # 申报价值取 Declared Value for Customs（不是 for Carriage）
-    "declarecustom": ("DECLARED VALUE FOR CUSTOMS",),
     "sfg": ("AIRPORT OF DEPARTURE",),
     "mdg": ("AIRPORT OF DESTINATION",),
     "hbh": ("REQUESTED FLIGHT/DATE", "REQUESTED FLIGHT"),
@@ -88,7 +87,6 @@ FIELD_LABEL_HINTS: dict[str, tuple[str, ...]] = {
     "zdpiece": ("NO. OF PIECES RCP", "PIECES RCP"),
     "zdweight": ("GROSS WEIGHT",),
     "ratelevel": ("RATE CLASS",),
-    "jfweight": ("CHARGEABLE WEIGHT",),
     "rate": ("RATE/CHARGE", "RATE CHARGE"),
     "zdvolume": ("VOLUME",),
     "pm": ("NATURE AND QUANTITY",),
@@ -101,15 +99,25 @@ FIELD_LABEL_HINTS: dict[str, tuple[str, ...]] = {
 }
 
 
+# 文本命中框紧贴字形边缘，前端描边会把笔画压住一点；统一外扩几个 PDF 点。
+# 2pt 在 A4/信纸页面上约等于 0.3% 宽高，缩放后观感就是「框松一点」。
+BOX_PADDING = 2.0
+
+
 def _normalize_box(
     rect: tuple[float, float, float, float], width: float, height: float
 ) -> list[float]:
     x0, y0, x1, y1 = rect
     if width <= 0 or height <= 0:
         return [0.0, 0.0, 0.0, 0.0]
+    # 外扩后再裁到页内，避免边缘字段的框超出页面
+    x0 = max(0.0, x0 - BOX_PADDING)
+    y0 = max(0.0, y0 - BOX_PADDING)
+    x1 = min(width, x1 + BOX_PADDING)
+    y1 = min(height, y1 + BOX_PADDING)
     return [
-        round(max(0.0, x0 / width), 4),
-        round(max(0.0, y0 / height), 4),
+        round(x0 / width, 4),
+        round(y0 / height, 4),
         round(max(0.0, (x1 - x0) / width), 4),
         round(max(0.0, (y1 - y0) / height), 4),
     ]
@@ -337,8 +345,14 @@ def _box_distance(rect: Any, anchor: Any) -> float:
     return ((rect_x - anchor_x) ** 2 + (rect_y - anchor_y) ** 2) ** 0.5
 
 
-def _quote_boxes(page: Any, quote: str | None) -> list[Any]:
-    """用原文引用在页面上找锚点：整条 → 去 Markdown → 唯一片段。"""
+def _quote_boxes(page: Any, quote: str | None, value: str | None = None) -> list[Any]:
+    """用原文引用在页面上找锚点：整条 → 去 Markdown → 唯一片段 → 值所在单元格。
+
+    表格转写出来的引用常是 `6.95 | 18295.88 | 1262803_...` 这种「单元格拼接」，
+    页面上并没有竖线，整条与片段都可能搜不到；最后一步按竖线切单元格，
+    用**与字段值相同的那个单元格**当锚点（表格行里同一个值可能多处出现，
+    这次命中可能不止一个，但由于锚点就是值本身，最终框仍会落在正确的一行）。
+    """
 
     if not quote or not quote.strip():
         return []
@@ -359,6 +373,21 @@ def _quote_boxes(page: Any, quote: str | None) -> list[Any]:
             continue
         if len(rects) == 1:
             return rects
+    # 单元格拼接的引用：取与字段值相同的那一格（数字/编号类字段最有效）
+    target = _normalized_text(value or "")
+    if target:
+        for cell in re.split(r"[|]", quote):
+            cell_text = cell.strip(" .,;:")
+            if len(cell_text) < 3:
+                continue
+            if _normalized_text(cell_text) != target:
+                continue
+            try:
+                rects = page.search_for(cell_text)
+            except Exception:  # noqa: BLE001
+                rects = []
+            if rects:
+                return rects
     return []
 
 
@@ -536,6 +565,95 @@ def _card_candidates(
     ]
 
 
+_MONTH_ABBR = (
+    "JAN",
+    "FEB",
+    "MAR",
+    "APR",
+    "MAY",
+    "JUN",
+    "JUL",
+    "AUG",
+    "SEP",
+    "OCT",
+    "NOV",
+    "DEC",
+)
+
+
+def _search_variants(value: str) -> list[str]:
+    """一个字段值的候选搜索串，按「最精确 → 最宽松」排列。
+
+    舱单里的公司名+地址常被抽成一整行，PDF 版面上却是多行；
+    数字可能带千分位（6,687），日期可能写成 `5.OCT/2026`。
+    整串找不到时依次退到：逐行 → 去空格/千分位 → 取前几个词 → 日期别名。
+    """
+
+    probe = str(value or "").strip()
+    if not probe:
+        return []
+
+    variants: list[str] = []
+
+    def add(candidate: str) -> None:
+        text = str(candidate or "").strip()
+        if text and text not in variants:
+            variants.append(text)
+
+    add(probe)
+
+    # 多行/竖线分隔的值：逐段试（地址、收发货人常这样）
+    for piece in re.split(r"[\n|]+", probe):
+        add(piece)
+
+    # 数字的紧凑写法：6,687 / 6 687 → 6687
+    compact = re.sub(r"[\s,]", "", probe)
+    if len(compact) >= 3:
+        add(compact)
+    # 带连字符的编号：416-52331591 → 41652331591（舱单页头常不带连字符）
+    compact_hyphen = re.sub(r"[\s,\-]", "", probe)
+    if len(compact_hyphen) >= 6:
+        add(compact_hyphen)
+    # 反向：纯数字值补一个带千分位的写法（6687 → 6,687），版面上常带逗号。
+    # 只给 4-6 位（重量/件数那类）：11 位手机号加千分位没有意义，还可能误命中金额
+    if probe.isdigit() and 4 <= len(probe) <= 6:
+        add(f"{int(probe):,}")
+
+    # 长文本只取开头几个词：整串跨行时必然搜不到
+    if len(probe) > 24:
+        words = probe.split()
+        add(" ".join(words[:3]))
+        add(probe[:24])
+        # 「名称+地址」常被抽成一整行，开头 12 个字符通常还在第一行、且不含后段 OCR 误差
+        add(probe[:12])
+
+    # 纯数字（电话/编号）：补「去国家码」「取尾号」两种写法
+    # 例：528183185300 → 8183185300（版面上写作 +52 8183185300）
+    if probe.isdigit() and len(probe) >= 8:
+        add(probe[-8:])
+        if len(probe) >= 10:
+            add(probe[-10:])
+        if probe.startswith("86") and len(probe) > 10:
+            add(probe[2:])
+
+    # 日期别名：2026-10-05 → 2026-10-5 / 5.OCT/2026 / 05-Oct-26
+    match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", probe)
+    if match:
+        year, month, day = (int(part) for part in match.groups())
+        add(f"{year}-{month}-{day}")
+        if 1 <= month <= 12:
+            add(f"{day}.{_MONTH_ABBR[month - 1]}/{year}")
+            add(f"{day:02d}.{_MONTH_ABBR[month - 1]}/{year}")
+            month_name = _MONTH_ABBR[month - 1].title()
+            add(f"{day:02d}-{month_name}-{year % 100}")
+            add(f"{day}-{month_name}-{year % 100}")
+            # 舱单页头常只写「日-月」，不带年份（13-Oct）
+            add(f"{day:02d}-{month_name}")
+            add(f"{day}-{month_name}")
+
+    return variants
+
+
 def _row_distance(anchor: Any, rect: Any) -> float:
     """值到锚点行的纵向距离：同一行算 0，越远越大。"""
 
@@ -563,6 +681,103 @@ def _card_rect(
     return min(candidates, key=lambda rect: (_row_distance(anchor, rect), rect.x0))
 
 
+# 页头字段：只印在表格上方（MAWB / 航班号 / 航班日期），
+# 用「锚点行范围」去裁必然裁掉它们，必须允许整页搜索。
+PAGE_LEVEL_KEYS = frozenset({"mawb", "hbh", "hbrq"})
+
+# 行内优先、找不到再整页兜底：始发港/目的港在部分舱单里只印在页头航线栏
+# （PORT OF LADING / PORT OF UNLADING），表格行里没有对应单元格。
+HEADER_FALLBACK_KEYS = frozenset({"sfg", "dest_port"})
+
+# 行内单元格是多行的（地址常 3-4 行），而锚点（分单号）在单元格里垂直居中：
+# 只从锚点上方 5pt 开始搜，地址前几行就落在范围外、永远没有框。
+ROW_MARGIN_UP = 60.0
+
+
+def _normalized_text(text: str) -> str:
+    """只留字母数字与汉字，用于模糊比对（容忍空格、标点、大小写差异）。"""
+
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(text).lower())
+
+
+def _page_lines(page: Any) -> list[tuple[tuple[float, float, float, float], str]]:
+    """页面上的文本行与 bbox，供模糊匹配使用。"""
+
+    lines: list[tuple[tuple[float, float, float, float], str]] = []
+    try:
+        blocks = page.get_text("dict").get("blocks", [])
+    except Exception:  # noqa: BLE001 - 解析异常时放弃模糊匹配
+        return lines
+    for block in blocks:
+        for line in block.get("lines", []):
+            text = "".join(span.get("text", "") for span in line.get("spans", []))
+            if text.strip():
+                lines.append((tuple(line["bbox"]), text))
+    return lines
+
+
+def _fuzzy_rect(
+    page: Any,
+    value: str,
+    top: float,
+    bottom: float,
+    anchor: Any | None = None,
+) -> Any | None:
+    """模糊定位：按行比对（忽略空格/标点/大小写），容忍 OCR 误差。
+
+    VLM 转写与 PDF 文本层经常有细差（`GALENA` vs `GALEANA`、`LEONCJUAL` vs
+    `LECHUGAL`），整串搜索必然失败。这里取相似度最高的那一行：
+    相似度 ≥0.75，或该行文本是字段值的一部分（「名称+地址」拼一行时后者更常见）。
+    """
+
+    try:
+        import pymupdf
+    except ImportError:  # pragma: no cover
+        return None
+
+    target = _normalized_text(value)
+    if len(target) < 4:
+        return None
+    # 电话这类纯数字值：抽取时已经去掉了连字符/空格，版面却是 0752-5855105，
+    # 字面搜索必然失败。这里按「去掉非数字后是否包含」判定，兼容各种分隔写法。
+    digits_target = target if target.isdigit() and len(target) >= 7 else ""
+
+    best_key: tuple[float, float] | None = None
+    best_rect = None
+    for bbox, text in _page_lines(page):
+        y0, y1 = bbox[1], bbox[3]
+        if y1 < top or y0 > bottom:
+            continue
+        candidate = _normalized_text(text)
+        if len(candidate) < 4:
+            continue
+        if digits_target and digits_target in re.sub(r"\D", "", text):
+            score = 0.97
+        elif candidate in target:
+            score = 0.98
+        else:
+            score = difflib.SequenceMatcher(None, target, candidate).ratio()
+        if score < 0.75:
+            continue
+        rect = pymupdf.Rect(bbox)
+        distance = _row_distance(anchor, rect) if anchor is not None else rect.y0
+        key = (round(score, 3), -distance)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_rect = rect
+    return best_rect
+
+
+def _page_rect(page: Any, value: str) -> Any | None:
+    """整页范围找值，取最靠上的一处（页头优先），用于页头字段。"""
+
+    for candidate in _search_variants(value):
+        hits = page.search_for(candidate)
+        if hits:
+            return min(hits, key=lambda rect: rect.y0)
+    return None
+
+
 def locate_manifest_fields(
     pdf_path: Path,
     page_map: dict[int, int],
@@ -586,22 +801,30 @@ def locate_manifest_fields(
     if not anchor_value:
         return locate_fields(pdf_path, page_map, fields)
 
+    located = False
     try:
         with pymupdf.open(pdf_path) as pdf:
             for global_index, page_no in page_map.items():
                 if page_no < 1 or page_no > pdf.page_count:
                     continue
                 page = pdf.load_page(page_no - 1)
-                hits = page.search_for(anchor_value)
+                # 分单号也可能带空格/连字符差异，逐个候选试
+                hits: list[Any] = []
+                for candidate in _search_variants(anchor_value):
+                    hits = page.search_for(candidate)
+                    if hits:
+                        break
                 if not hits:
                     continue
+                located = True
                 anchor_rect = hits[0]
-                card_top = anchor_rect.y0 - 5
+                # 上界：锚点行上方留出多行单元格的余量（地址 3-4 行，锚点垂直居中）
+                card_top = max(0.0, anchor_rect.y0 - ROW_MARGIN_UP)
                 card_bottom = float(page.rect.height)
                 # 同页还有其他分单号命中时，以最近的一个作为本卡片的下边界；
                 # 距离太近（<40pt）的命中是同一卡片里的重复标题，不算新卡片
                 for other in hits[1:]:
-                    if other.y0 > card_top + 40:
+                    if other.y0 > anchor_rect.y0 + 40:
                         card_bottom = min(card_bottom, other.y0 - 5)
                         break
                 width = float(page.rect.width)
@@ -613,10 +836,42 @@ def locate_manifest_fields(
                         continue
                     if key == "hawb_no":
                         rect = anchor_rect
+                    elif key in PAGE_LEVEL_KEYS:
+                        # 主单号/航班号/航班日期印在页头（表格上方），
+                        # 不能限制在锚点行范围内，否则永远定位不到
+                        rect = _page_rect(page, text)
+                        if rect is None:
+                            rect = _fuzzy_rect(
+                                page, text, 0.0, float(page.rect.height)
+                            )
                     else:
-                        rect = _card_rect(
-                            page, anchor_rect, text, card_top, card_bottom
-                        )
+                        # 整串搜不到就退到逐行 / 去分隔符 / 前缀 / 日期别名，
+                        # 否则长地址、带千分位的重量会整片没有高亮
+                        candidates = _search_variants(text)
+                        if key.startswith("companycode_"):
+                            # 国家列多印全称（CHINA / USA），抽取值却是二字码：
+                            # 把全称也当作候选（与分单侧 _country_hits 同一套映射）
+                            candidates = [
+                                *candidates,
+                                *COUNTRY_NAME_ALIASES.get(text.upper(), ()),
+                            ]
+                        rect = None
+                        for candidate in candidates:
+                            rect = _card_rect(
+                                page, anchor_rect, candidate, card_top, card_bottom
+                            )
+                            if rect is not None:
+                                break
+                        if rect is None and key in HEADER_FALLBACK_KEYS:
+                            # 港口只印在页头航线栏时，行内找不到就整页找
+                            rect = _page_rect(page, text) or _fuzzy_rect(
+                                page, text, 0.0, float(page.rect.height)
+                            )
+                        if rect is None:
+                            # 精确值都不匹配（VLM 与文本层有 OCR 误差）：按行模糊比对
+                            rect = _fuzzy_rect(
+                                page, text, card_top, card_bottom, anchor_rect
+                            )
                     if rect is None:
                         continue
                     locations[key] = [
@@ -630,6 +885,10 @@ def locate_manifest_fields(
                 return locations
     except Exception as exc:  # noqa: BLE001
         logger.warning("舱单字段定位失败（%s）：%s", pdf_path.name, exc)
+    if not located:
+        # PDF 文本层里找不到分单号（扫描件 / Office 转换丢文本）：
+        # 退到整页搜索，至少让能搜到的字段有高亮，而不是整行都没有。
+        return locate_fields(pdf_path, page_map, fields)
     return {}
 
 
@@ -675,7 +934,9 @@ def locate_fields(
                     if page_no < 1 or page_no > pdf.page_count:
                         continue
                     page = pdf.load_page(page_no - 1)
-                    quote_boxes = _quote_boxes(page, (quotes or {}).get(key))
+                    quote_boxes = _quote_boxes(
+                        page, (quotes or {}).get(key), str(value)
+                    )
                     rects = _locate_one(
                         page,
                         key,

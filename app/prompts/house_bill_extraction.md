@@ -28,7 +28,7 @@
 | state_fhr_hawb | State / Province | 州或省名称原文（如 TEXAS、JIANGSU、CA）；**中国地址没有州/省，填 null** |
 | lxr_fhr_hawb | Contact / Attn | 联系人姓名，没有则 null |
 | phone_fhr_hawb | Mobile / Tel | 手机号只输出数字：去掉 `+` 号，中国号码再去掉 86 前缀（`+8651257382098` → `51257382098`）；传真不算 |
-| email_fhr_hawb | Email | 邮箱，统一小写 |
+| email_fhr_hawb | Email | **原文照抄，保留大小写**（核对时后端会忽略大小写，不要自行改成小写） |
 | fax_fhr_hawb | Fax | 传真号码，只保留号码本身；没有则 null |
 
 ### 三、收货人 CONSIGNEE（10 项）
@@ -48,22 +48,20 @@
 | email_shr_hawb |
 | fax_shr_hawb |
 
-### 四、申报（2 项）
+### 四、申报（1 项）
 
 | 键 | 版式栏位 | 抽取要求 |
 |---|---|---|
-| declarecustom | Declared Value for Customs | **只取 Declared Value for Customs 这一栏**的原文（如 6790.00 USD）；不要取 Declared Value for Carriage 里的 NVD，也不要改写为纯数字 |
 | handlinginfo | Handling Information | 原文照抄，多行合并为一行；空栏填 null |
 
-### 五、制单与货物信息（8 项）
+### 五、制单与货物信息（7 项）
 
 | 键 | 版式栏位 | 抽取要求 |
 |---|---|---|
 | zdpiece | No. of Pieces RCP | 制单件数，只输出整数 |
 | zdweight | Gross Weight | 制单重量，千克数字 |
 | ratelevel | Rate Class | 运价类别原文（如 M、N、Q、C、S、R、U、E） |
-| jfweight | Chargeable Weight | 计费重量，数字（如 440.0） |
-| rate | Rate/Charge | 只取货物表格**本行** Rate/Charge 列的数字，不带货币符号与千分位；本行该列空白就填 null，**不要**取下方 Weight Charge / Total Prepaid 等费用区金额，也不要按 Total ÷ Chargeable Weight 反算 |
+| rate | Rate/Charge | 只取货物表格**本行** Rate/Charge 列的数字，不带货币符号与千分位；本行该列空白就填 null，**不要**取下方 Weight Charge / Total Prepaid 等费用区金额，也不要按 Total ÷ 计费重量反算 |
 | ratetotal | Total | 只取货物表格**本行** Total 列的数字，不带货币符号与千分位；空白填 null，不要取下方 Weight Charge / Total Prepaid / Total Collect 的金额 |
 | zdvolume | Nature and Quantity of Goods 中的 DIMS/VOL | 制单体积，立方米数字；只有尺寸（如 DIMS 137x105x170 CM）时按尺寸换算为 M³ |
 | pm | Nature and Quantity of Goods | 品名/货物描述原文：只保留货物名称、型号、规格描述；剔除 `HS CODE`、发票号（`IN.xxx`）、`P.O.`、`DIMS/VOL` 等栏内非品名行；多行品名合并为一行 |
@@ -76,13 +74,16 @@
 4. 名称保留原文大小写与语言，不要翻译。**地址保留原文**（一般 1–2 行，原文写在同一行的城市也一并保留）；城市、州/省、邮编、国家二字码通常位于地址下方同一行，分别填入 `city_*` / `state_*` / `postcode_*` / `companycode_*`；**中国地址没有州/省，`state_*` 填 null**；国家只填 2 位代码（`companycode_*`，如 China→CN、United States→US），不要写全称、也不要塞进地址。
 5. 电话只保留号码本身，不要填传真（Fax）除非页面只有 Fax。
 6. 数字字段不要带单位、货币符号、千分位；不要把小计/合计当成本单值。
-7. 制单字段（zdpiece / zdweight / ratelevel / jfweight / rate / ratetotal）只取货物表格中**本单对应行**的值，不要取页脚合计。**Rate/Charge、Total 空栏很常见**（本行只印了件数、毛重、Rate Class、计费重量时）：此时必须填 null——不要用相邻行/相邻栏的数字、下方费用区金额填充，也不要用「Total ÷ Chargeable Weight」或「Chargeable Weight × 单价」反算。
+7. 制单字段（zdpiece / zdweight / ratelevel / rate / ratetotal）只取货物表格中**本单对应行**的值，不要取页脚合计。**Rate/Charge、Total 空栏很常见**（本行只印了件数、毛重、Rate Class 时）：此时必须填 null——不要用相邻行/相邻栏的数字、下方费用区金额填充，也不要用「Total ÷ 毛重」或「毛重 × 单价」反算。
 8. 品名与体积都来自 Nature and Quantity of Goods 栏：`pm` 只放品名，**不要包含 `DIMS ... CM`、`VOL ... M3` 等尺寸/体积文字，也不要包含 `HS CODE: ...`、`IN.xxxx` 发票号、`P.O.` 等栏内附加行**；`zdvolume` 只放数值（体积也只输出这一份，不要另出 volume）。
 9. 同一字段在页面出现多次且值不同（如手写更正）：以最清晰的打印值为准，并在 `warnings` 说明。
 10. 跨页时合并同一份分单的信息；若续页出现另一份分单的单号，只取属于本单的内容。
 11. `confidence` 表示整体抽取可信度（0–1）：字段清晰齐全 ≥0.9；有缺字段 0.7–0.9；大量模糊/缺字段 <0.7。
 12. `warnings` 只写必要的异常说明，每条不超过 30 字，最多 3 条；正常抽取时输出空数组。
 13. **每个非空字段都要在 `evidence` 里给一条原文引用**：`quote` ≤60 字，逐字引用页面文本（可跨行，用空格连接），不要改写、翻译或补全；宁可只引用值本身，也不要编造。
+    - 引用必须是**一段连续原文**，不要用 `...`、`/` 之类把不相邻的两处拼在一起，也不要拼上另一个字段的内容；
+    - `hbrq` 的引用必须是**包含该日期的那一段**（如航班行 `5Y518/22`、或 `21/OCT/2026`），不要把两处日期拼进同一条 quote；
+    - 日/月/年分别来自不同位置（如航班行只写 `/22`，月份年份来自另一处 `21/OCT/2026`）时：`status` 用 `needs_review`，并在 `warnings` 写明「日期由多处拼接，请确认」。
 14. `status` 取 `confirmed`（有明确原文）/ `needs_review`（值不确定或找不到原文）/ `conflict`（同字段出现多个不同值）。冲突时 `fields` 里保留最可信的一个，并在该字段的 `alternatives` 数组列出其它值。
 15. `evidence` 里的 `confidence` 是字段级可信度（0–1），与整体 `confidence` 分开。
 16. 不要为缺失字段编造 `quote`；不确定就不写该字段的 `evidence`，后端会按 `needs_review` 处理。
@@ -123,12 +124,10 @@
     "phone_shr_hawb": "18649636328",
     "email_shr_hawb": null,
     "fax_shr_hawb": null,
-    "declarecustom": "6790.00 USD",
     "handlinginfo": "PLEASE INFORM CONSIGNEE IMMEDIATELY UPON ARRIVAL.",
     "zdpiece": "1",
     "zdweight": "440.00",
     "ratelevel": "Q",
-    "jfweight": "440.0",
     "rate": "12.50",
     "ratetotal": "5500.00",
     "zdvolume": "2.45",

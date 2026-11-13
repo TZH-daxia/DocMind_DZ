@@ -2,12 +2,14 @@
 
 两套字段目录：
 - `HOUSE_FIELD_SPECS`：分单（HAWB）单证模板字段，按 AWB 版面分组：
-  运输 7、发货人 10、收货人 10、申报 2、制单/货物 8，共 37 项。
+  运输 7、发货人 10、收货人 10、申报 1、制单/货物 7，共 35 项。
   件数/重量/体积只有制单口径（zdpiece/zdweight/zdvolume），不再重复抽取；
   By First Carrier（航班二字码）不抽，航班只保留 hbh（Flight No.）。
-- `MANIFEST_FIELD_SPECS`：舱单只保留核对字段（分单号 + 目的港 + 件数/重量/计费重/体积）。
+  `jfweight`（计费重量）与 `declarecustom`（申报价值）不抽取：恒为空，由前端人工填写。
+- `MANIFEST_FIELD_SPECS`：舱单按行抽取，字段与分单同构（主单号/分单号/始发港/目的港 +
+  收发货人各 10 项 + 件数/重量/体积/品名），全部映射进分单字段。
 
-`key` 同时用于：LLM 输出 JSON 的键、核对结果的键、前端表格列。
+`key` 同时用于：LLM 输出 JSON 的键、结果结构的键、前端表格列。
 """
 
 from dataclasses import dataclass
@@ -113,21 +115,16 @@ SHIPMENT_TEMPLATE_SPECS: tuple[FieldSpec, ...] = (
     FieldSpec("currency", "币种（Currency）", "shipment", "text"),
 )
 
+# 申报价值（declarecustom）不抽取：恒为空，由前端人工填写
 DECLARATION_SPECS: tuple[FieldSpec, ...] = (
-    FieldSpec(
-        "declarecustom",
-        "申报价值（Declared Value for Customs）",
-        "declaration",
-        "text",
-    ),
     FieldSpec("handlinginfo", "操作信息（Handling Information）", "declaration", "text"),
 )
 
+# 计费重量（jfweight）不抽取：恒为空，由前端人工填写
 CARGO_SPECS: tuple[FieldSpec, ...] = (
     FieldSpec("zdpiece", "制单件数（No. of Pieces RCP）", "cargo", "integer"),
     FieldSpec("zdweight", "制单重量（Gross Weight）", "cargo", "number"),
     FieldSpec("ratelevel", "运价类别（Rate Class）", "cargo", "text"),
-    FieldSpec("jfweight", "计费重量（Chargeable Weight）", "cargo", "number"),
     FieldSpec("rate", "单价（Rate/Charge）", "cargo", "number"),
     FieldSpec("ratetotal", "总价（Rate/Total）", "cargo", "number"),
     FieldSpec("zdvolume", "制单体积（Volume）", "cargo", "number"),
@@ -145,26 +142,29 @@ HOUSE_FIELD_SPECS: tuple[FieldSpec, ...] = (
 HOUSE_FIELD_KEYS: tuple[str, ...] = tuple(spec.key for spec in HOUSE_FIELD_SPECS)
 FIELD_LABELS: dict[str, str] = {spec.key: spec.label for spec in HOUSE_FIELD_SPECS}
 
-# 舱单只抽取核对用到的字段：分单号（匹配主键）+ 目的港 + 件数/重量/计费重/体积
+# 舱单按「每行 = 一份分单的概要」抽取，字段与分单同构（收发货人各 10 项），
+# 但只作为舱单数据展示 + 一致性核对，不参与 ERP 入库。
 MANIFEST_FIELD_SPECS: tuple[FieldSpec, ...] = (
+    FieldSpec("mawb", "主单号（MAWB No.）", "shipment", "text"),
     FieldSpec("hawb_no", "分单号", "shipment", "text"),
+    FieldSpec("sfg", "始发港", "shipment", "port"),
     FieldSpec("dest_port", "目的港", "shipment", "port"),
-    FieldSpec("pieces", "件数", "shipment", "integer"),
-    FieldSpec("weight", "重量", "shipment", "number"),
-    FieldSpec("chargeable_weight", "计费重量", "cargo", "number"),
-    FieldSpec("volume", "体积", "shipment", "number"),
+    FieldSpec("hbh", "航班号", "shipment", "flight"),
+    FieldSpec("hbrq", "航班日期", "shipment", "date"),
+    *_party_specs("shipper"),
+    *_party_specs("consignee"),
+    FieldSpec("pieces", "件数", "cargo", "integer"),
+    FieldSpec("weight", "重量", "cargo", "number"),
+    FieldSpec("volume", "体积", "cargo", "number"),
+    FieldSpec("pm", "品名", "cargo", "text"),
 )
-# 核对口径 = 舱单字段去掉匹配主键
-COMPARE_FIELD_SPECS: tuple[FieldSpec, ...] = tuple(
-    spec for spec in MANIFEST_FIELD_SPECS if spec.key != "hawb_no"
-)
-# 核对字段（舱单口径）→ 分单字段（单证接口名）：只有对不齐名字的才需要映射
+# 舱单口径 → 分单接口名：只有对不齐名字的才需要映射（转分单 & 待审核取分单号都用它）
 HOUSE_KEY_BY_COMPARE_KEY: dict[str, str] = {
     "hawb_no": "hawb",
+    "sfg": "sfg",
     "dest_port": "mdg",
     "pieces": "zdpiece",
     "weight": "zdweight",
-    "chargeable_weight": "jfweight",
     "volume": "zdvolume",
 }
 MANIFEST_FIELD_KEYS: tuple[str, ...] = tuple(spec.key for spec in MANIFEST_FIELD_SPECS)

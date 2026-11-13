@@ -33,7 +33,10 @@ def test_post_field_descriptions_are_readable() -> None:
     spec = client.get("/openapi.json").json()
 
     form = _upload_form_schema(spec)
-    assert "单证文件" in form["properties"]["file"]["description"]
+    # 三个字段的描述都要是可读中文：单票的 files、兼容的 file、识别方式 mode
+    assert "批量模式" in form["properties"]["file"]["description"]
+    assert "单票" in form["properties"]["files"]["description"]
+    assert "single=单票" in form["properties"]["mode"]["description"]
 
     submit = spec["components"]["schemas"]["SubmitRequest"]["properties"]
     assert "待提交的页签" in submit["documents"]["description"]
@@ -48,9 +51,9 @@ def test_upload_fields_use_binary_format() -> None:
 
     form = _upload_form_schema(spec)
 
-    # 单个 file 字段：必填时直接是 string/binary，Optional 时包一层 anyOf，两种都认
-    file_schema = form["properties"]["file"]
-    assert '"format": "binary"' in json.dumps(file_schema)
-    assert "files" not in form["properties"]
+    # 单票的 files（数组）与批量的 file（单值）都要输出 binary，
+    # 否则 Swagger UI 会把上传字段渲染成普通字符串并预填乱码
+    assert '"format": "binary"' in json.dumps(form["properties"]["file"])
+    assert '"format": "binary"' in json.dumps(form["properties"]["files"])
     # OAS 3.1 的 contentMediaType 会让 Swagger UI 预填随机二进制
     assert "contentMediaType" not in json.dumps(spec)

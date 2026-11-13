@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AI-单证识别</title>
-    <link rel="stylesheet" href="styles.css?v=20261020" />
+    <link rel="stylesheet" href="styles.css?v=20261112b" />
   </head>
   <body>
     <main class="app-shell">
@@ -49,11 +49,6 @@
           <div class="file-list" id="taskList">
             <div class="empty-state">还没有任务</div>
           </div>
-
-          <div class="file-panel-foot">
-            <span class="dot"></span>
-            主单识别后跳过抽取，只核对分单与舱单
-          </div>
         </aside>
 
         <section class="panel process-panel">
@@ -70,10 +65,9 @@
           </div>
 
           <div class="selected-file">
-            <span class="file-symbol" id="selectedType">—</span>
+            <!-- 头部只显示任务 ID：源文件名在左侧任务列表里已有，创建时间不进标题 -->
             <div class="selected-copy">
-              <strong id="selectedName">请选择左侧任务</strong>
-              <span id="selectedTaskId">任务 ID 未加载</span>
+              <strong id="selectedTaskId">任务 ID 未加载</strong>
             </div>
           </div>
 
@@ -114,6 +108,6 @@
     <div id="dialogRoot"></div>
     <div class="toast" id="toast"></div>
 
-    <script type="module" src="app.js?v=20261020"></script>
+    <script type="module" src="app.js?v=20261112b"></script>
   </body>
 </html>

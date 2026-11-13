@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import logging
 import re
 from datetime import datetime
@@ -42,14 +43,12 @@ from app.schemas.documents import (
     HouseBillComparison,
     ManifestDocument,
     ManifestEntry,
-    ManifestMaster,
     MasterBillInfo,
     PageRecord,
     Segment,
     TotalsCheck,
 )
-from app.schemas.fields import FIELD_LABELS
-from app.service.consistency import compare, compare_totals
+from app.schemas.fields import FIELD_LABELS, HOUSE_FIELD_KEYS
 from app.service.extraction import (
     ExtractionError,
     classify_pages_with_llm,
@@ -61,6 +60,7 @@ from app.service.extraction import (
     transcribe_house_zoom as transcribe_house_zoom_page,
 )
 from app.service.gates import ConcurrencyGates
+from app.service.normalizers import normalize_mawb
 from app.service.ports import normalize_port_fields, resolve_port
 from app.service.review import build_review_items
 from app.storage.file_store import FileStore
@@ -76,6 +76,78 @@ logger = logging.getLogger(__name__)
 
 # Office 文档要经 LibreOffice 转 PDF：单实例进程，必须串行（并发闸门 "office"）
 OFFICE_SUFFIXES = (".doc", ".docx", ".xls", ".xlsx")
+
+# 邮箱按 PDF 文本层校正：VLM 漏一个字母（lanshenglght / anshenglight）太常见，
+# 邮箱又是唯一能无损比对的字段，直接用文本层兜底，不用再花一次模型调用。
+EMAIL_KEYS: tuple[str, ...] = ("email_fhr_hawb", "email_shr_hawb")
+
+# 舱单行 → 分单接口字段：存在舱单时以舱单为准，前端只渲染「分单」页签，
+# 所以要把舱单行按这套映射转成分单字段（收发货人 20 项两边本就同名，直接透传）。
+MANIFEST_TO_HOUSE_FIELDS: dict[str, str] = {
+    "mawb": "mawb",
+    "hawb_no": "hawb",
+    "sfg": "sfg",
+    "dest_port": "mdg",
+    "hbh": "hbh",
+    "hbrq": "hbrq",
+    "pieces": "zdpiece",
+    "weight": "zdweight",
+    # 计费重量（jfweight）与申报价值不再由后端提供，统一留给前端人工填写，
+    # 所以舱单的 chargeable_weight 不再映射到分单字段。
+    "volume": "zdvolume",
+    "pm": "pm",
+}
+
+
+def _bills_from_manifest(manifest: ManifestDocument) -> list[HouseBill]:
+    """把舱单里的每一行（一个 HAWB）转成一份「分单」。
+
+    以舱单为准时不抽分单页，分单数据全部来自舱单行：字段按
+    `MANIFEST_TO_HOUSE_FIELDS` 映射到分单接口名，缺的字段留空（前端表单会显示为空）；
+    坐标一并重映射，点字段时高亮落在舱单页而不是分单页。
+    """
+
+    bills: list[HouseBill] = []
+    for index, entry in enumerate(manifest.entries, start=1):
+        fields: dict[str, str | None] = {key: None for key in HOUSE_FIELD_KEYS}
+        locations: dict[str, list[dict[str, Any]]] = {}
+        for source_key, value in (entry.fields or {}).items():
+            target = MANIFEST_TO_HOUSE_FIELDS.get(source_key, source_key)
+            if target in fields:
+                fields[target] = value
+        for source_key, boxes in (entry.field_locations or {}).items():
+            target = MANIFEST_TO_HOUSE_FIELDS.get(source_key, source_key)
+            if target:
+                locations[target] = boxes
+        bills.append(
+            HouseBill(
+                bill_id=f"bill_{index:03d}",
+                page_indexes=list(manifest.page_indexes),
+                fields=fields,
+                field_locations=locations,
+                confidence=entry.confidence,
+                warnings=[
+                    *entry.warnings,
+                    f"数据来自舱单第 {entry.line_no or index} 行",
+                ],
+                source="manifest",
+            )
+        )
+    return bills
+
+
+def _is_degenerate_transcription(text: str) -> bool:
+    """视觉转写是否"读废了"：大量竖线/空单元格、几乎没有有效内容。
+
+    典型废结果：`416 | PVG | 52342905 | | | | | …`（十几 KB 全是分隔符）。
+    """
+
+    compact = re.sub(r"\s+", "", text or "")
+    if len(compact) < 40:
+        return True
+    return compact.count("|") / len(compact) >= 0.6
+EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+EMAIL_SIMILARITY_THRESHOLD = 0.9
 
 # 货物行右侧的计价列：Rate/Charge 与 Total 必须与计费重量同行、且在其右侧
 CHARGE_COLUMN_KEYS: tuple[str, ...] = ("rate", "ratetotal")
@@ -230,6 +302,11 @@ def _validate_candidates(
             stale_quotes += 1
             item["status"] = "needs_review"
             _append_candidate_warning(item, "原文引用未在转写文本中找到")
+        # 日期字段的引用必须是连续的一段：用 `...` 把两处日期拼起来时，
+        # 引用本身就不等于页面原文，直接标待审核并说明原因。
+        if item.get("field_key") == "hbrq" and re.search(r"\.{2,}|…", quote):
+            item["status"] = "needs_review"
+            _append_candidate_warning(item, "日期引用由多段拼接，请确认航班日期")
     warnings: list[str] = []
     if stale_quotes:
         warnings.append(
@@ -250,6 +327,58 @@ def _box_inside(box: dict[str, Any], block: dict[str, Any]) -> bool:
     center_x = x + width / 2
     center_y = y + height / 2
     return bx <= center_x <= bx + bw and by <= center_y <= by + bh
+
+
+# AWB 页首的主单号：416|PVG|52331591 / 416 TSN 10799445 / 416-52331591
+_MAWB_HEAD_RE = re.compile(r"\d{3}[\s\-|/]{0,3}[A-Z]{0,3}[\s\-|/]{0,3}\d{8}")
+# 电话行里的数字串（+865125732098）形状与主单号相同，必须排除
+_PHONE_LINE_RE = re.compile(r"\b(TE|TEL|FAX|MOBILE)\b|[+]", re.IGNORECASE)
+
+
+_MAWB_DIGITS_RE = re.compile(r"\d{11}")
+
+
+def _canonical_master_no(value: str | None) -> str | None:
+    """主单号必须是「3 位航司代码 + 8 位序号」。
+
+    分单号（SZA26100005）、发票号之类的也能凑出 11 位数字，不能当主单号参与
+    单票多主单判定，否则会把一张 House AWB 误判成「第二个主单」。
+    """
+
+    if not value:
+        return None
+    digits = re.sub(r"\D", "", value)
+    if not _MAWB_DIGITS_RE.fullmatch(digits):
+        return None
+    return f"{digits[:3]}-{digits[3:]}"
+
+
+def _head_master_nos(
+    pages: list[PageRecord], segments: list[Segment]
+) -> dict[str, list[int]]:
+    """从 AWB 页页首扫主单号（只读已转写文本，不额外调模型）。
+
+    单票模式用它发现「第二个主单号印在分单页左上角」的情况：这类页面整页被判为
+    house_bill，不会出现在 master_bills 里，只看 master_bills 会漏判。
+    """
+
+    targets = {
+        index
+        for segment in segments
+        if segment.kind in {"master_bill", "house_bill"}
+        for index in segment.page_indexes
+    }
+    found: dict[str, list[int]] = {}
+    for page in pages:
+        if page.index not in targets or not page.text:
+            continue
+        lines = [line for line in page.text.splitlines() if line.strip()][:3]
+        head = "\n".join(line for line in lines if not _PHONE_LINE_RE.search(line))
+        for token in _MAWB_HEAD_RE.findall(head):
+            number = normalize_mawb(token)
+            if number and page.index not in found.get(number, []):
+                found.setdefault(number, []).append(page.index)
+    return found
 
 
 # 品名栏里的非品名附加行：HS CODE、发票号、P.O. 等
@@ -281,7 +410,8 @@ def _drop_unreliable_charge_fields(
     用定位结果兜底：不在计费重量右侧、或不同行，就视为空栏并清掉模型值。
     """
 
-    anchor_boxes = locations.get("jfweight") or []
+    # 锚点用制单重量（与 Rate/Total 同在货物行）；计费重量已不再抽取，不能再用它定位
+    anchor_boxes = locations.get("zdweight") or []
     if not anchor_boxes:
         return []
     anchor = anchor_boxes[0]
@@ -464,7 +594,19 @@ class Pipeline:
                 except Exception as exc:  # noqa: BLE001 - 单页失败不阻断整份文件
                     warnings.append(f"第 {page.index} 页图像转写失败：{exc}")
                     return
+                raw = page.text.strip()
                 if text and text.strip():
+                    if _is_degenerate_transcription(text) and len(raw) >= 200:
+                        # 视觉模型把整页读成一堆空单元格（"416 | PVG | 52342905 | | | …"）时，
+                        # 下游分类会把它当成"上一页表格续页"，进而丢页/判错单据类型。
+                        # 这类结果必须丢掉，回退到文本层（Office 转出的 PDF 文本层是干净的）。
+                        warnings.append(
+                            f"第 {page.index} 页视觉转写异常（有效内容过少），已改用文本层"
+                        )
+                        page.text = raw
+                        page.text_source = "text_layer"
+                        page.char_count = len(page.text)
+                        return
                     page.text = text.strip()
                     page.text_source = "vlm"
                     page.char_count = len(page.text)
@@ -742,6 +884,41 @@ class Pipeline:
                 if hawb_no := find_hawb_no(text):
                     segments[-1].doc_no = hawb_no
 
+        # 单票模式：多个文件必须属于同一个主单；识别出多个主单直接判失败。
+        # 判定看两处：主单段的 master_no + AWB 页首扫到的主单号。
+        # 只看 master_bills 会漏掉「第二个主单号印在分单页左上角」的情况（整页判 house_bill）。
+        if state.get("mode") == "single":
+            scanned = _head_master_nos(pages, segments)
+            # 主单号统一成 416-52342905 这种规范写法再比对：
+            # 模型有时回 41652342905、有时回带连字符的，直接比集合会凭空多出一个主单。
+            numbers = {
+                canonical
+                for bill in master_bills
+                if (canonical := _canonical_master_no(bill.master_no))
+            }
+            numbers |= {
+                canonical
+                for number in scanned
+                if (canonical := _canonical_master_no(number))
+            }
+            multiple = len(numbers) > 1 or (len(master_bills) > 1 and not numbers)
+            if multiple:
+                # 每个主单号都列出来（页首扫到的带上页码），否则用户只看到一个号，
+                # 会以为「同一个主单怎么算成两个」。
+                labels = "、".join(
+                    f"{number}（第{'/'.join(map(str, scanned[number]))}页）"
+                    if number in scanned
+                    else number
+                    for number in sorted(numbers)
+                ) or "、".join(
+                    f"第 {index} 份" for index in range(1, len(master_bills) + 1)
+                )
+                raise PipelineError(
+                    "SINGLE_TICKET_MULTIPLE_MASTER",
+                    f"单票模式只允许一个主单，当前识别到 {len(numbers) or len(master_bills)} 个主单"
+                    f"（{labels}），请改用批量识别",
+                )
+
         # 页面上的分类结果回写，前端可逐页查看判定依据
         kind_by_page = {kind.index: kind for kind in merged}
         for page in pages:
@@ -756,16 +933,24 @@ class Pipeline:
             len(item.page_indexes) for item in segments if item.kind == "manifest"
         )
         if house_count == 0:
-            if master_bills:
+            if master_bills and not manifest_pages:
                 warnings.append(
                     "文件只包含主单，已跳过字段抽取；请补充分单（HAWB）与舱单后再提交"
                 )
-                hint = f"主单 {len(master_bills)} 份"
+                hint = f"主单 {len(master_bills)} 份，未发现分单与舱单，已跳过字段抽取"
+            elif master_bills and manifest_pages:
+                warnings.append(
+                    "文件只包含主单与舱单：主单只登记不抽取，将只抽取舱单字段"
+                )
+                hint = (
+                    f"主单 {len(master_bills)} 份、舱单 {manifest_pages} 页，"
+                    "未发现分单，仅抽取舱单字段"
+                )
             elif manifest_pages:
                 warnings.append(
-                    "文件只包含舱单，已跳过字段抽取；请补充分单（HAWB）后再提交"
+                    "文件只包含舱单，将只抽取舱单字段；请补充分单（HAWB）后再提交"
                 )
-                hint = f"舱单 {manifest_pages} 页"
+                hint = f"舱单 {manifest_pages} 页，未发现分单，仅抽取舱单字段"
             else:
                 self._save_segments(task_id, segments, master_bills, warnings, pages)
                 raise PipelineError(
@@ -776,7 +961,7 @@ class Pipeline:
             await self._emit(
                 state,
                 "识别主单/分单/舱单",
-                f"{hint}，未发现分单，已跳过字段抽取",
+                hint,
                 52,
                 "warning",
             )
@@ -826,6 +1011,9 @@ class Pipeline:
 
         house_segments = [item for item in segments if item.kind == "house_bill"]
         manifest_segments = [item for item in segments if item.kind == "manifest"]
+        # 以舱单为准：有舱单时不再单独抽分单页（否则会得到两套互相矛盾的数据）
+        if manifest_segments:
+            house_segments = []
 
         total = len(house_segments) + (1 if manifest_segments else 0)
         finished = 0
@@ -837,7 +1025,7 @@ class Pipeline:
                 bill_no = segment.doc_no or f"第 {index} 份分单"
                 await self._emit(
                     state,
-                    "抽取分单与舱单字段",
+                    "抽取分单或舱单字段",
                     f"正在抽取分单 {bill_no}（第 {index}/{len(house_segments)} 份）",
                     55 + int(25 * finished / max(total, 1)),
                 )
@@ -870,7 +1058,6 @@ class Pipeline:
                 except (ModelCallFailedError, ExtractionError) as exc:
                     return HouseBill(
                         bill_id=f"bill_{index:03d}",
-                        segment_id=segment.segment_id,
                         page_indexes=segment.page_indexes,
                         fields={},
                         confidence=0.0,
@@ -885,6 +1072,15 @@ class Pipeline:
                     pages, segment.page_indexes, candidates
                 )
                 bill_warnings = [*bill_warnings, *quote_warnings]
+                # 邮箱用 PDF 文本层兜底：VLM 常漏一个字母（lanshenglght / anshenglight），
+                # 趁定位前改对，高亮框才能落到真实位置
+                pdf_path, page_map = self._source_context(
+                    task_id, pages, segment.page_indexes
+                )
+                bill_warnings = [
+                    *bill_warnings,
+                    *self._correct_emails(fields, pdf_path, page_map),
+                ]
                 field_locations = self._locate_segment_fields(
                     task_id,
                     pages,
@@ -919,7 +1115,6 @@ class Pipeline:
                 candidates = _align_candidates(candidates, fields)
                 return HouseBill(
                     bill_id=f"bill_{index:03d}",
-                    segment_id=segment.segment_id,
                     page_indexes=segment.page_indexes,
                     fields=fields,
                     field_locations=field_locations,
@@ -949,13 +1144,21 @@ class Pipeline:
                 index for segment in manifest_segments for index in segment.page_indexes
             ]
             await self._emit(
-                state, "抽取分单与舱单字段", "正在抽取舱单表格", 78
+                state, "抽取分单或舱单字段", "正在抽取舱单表格", 78
             )
             try:
                 result = await extract_manifest(self.gateway, pages, page_indexes)
+                # 舱单每行也做一次邮箱校正（只读一次 PDF 文本层）
+                pdf_path, page_map = self._source_context(
+                    task_id, pages, page_indexes
+                )
                 entries = []
                 for position, entry in enumerate(result["entries"], start=1):
                     entry_fields = entry["fields"]
+                    entry_warnings = [
+                        *entry["warnings"],
+                        *self._correct_emails(entry_fields, pdf_path, page_map),
+                    ]
                     entries.append(
                         ManifestEntry(
                             entry_id=f"mft_{position:04d}",
@@ -966,17 +1169,13 @@ class Pipeline:
                                 task_id, pages, page_indexes, entry_fields
                             ),
                             confidence=entry["confidence"],
-                            warnings=entry["warnings"],
+                            warnings=entry_warnings,
                         )
                     )
-                master_payload = result.get("master")
                 manifest_document = ManifestDocument(
                     segment_id=manifest_segments[0].segment_id,
                     page_indexes=page_indexes,
                     entries=entries,
-                    master=(
-                        ManifestMaster(**master_payload) if master_payload else None
-                    ),
                     warnings=result["warnings"],
                 )
                 if not entries:
@@ -985,10 +1184,14 @@ class Pipeline:
                 warning = f"舱单抽取失败，无法核对：{exc}"
                 warnings.append(warning)
                 await self._emit(
-                    state, "抽取分单与舱单字段", warning, 82, "error"
+                    state, "抽取分单或舱单字段", warning, 82, "error"
                 )
-        else:
-            warnings.append("未识别到舱单，未执行字段核对")
+        if manifest_document is not None:
+            # 以舱单为准：每一行转成一份分单，前端只渲染分单页签
+            house_bills = _bills_from_manifest(manifest_document)
+            warnings.append(
+                f"已按舱单生成 {len(house_bills)} 份分单（存在舱单时不使用分单页数据）"
+            )
 
         house_payload = [bill.model_dump() for bill in house_bills]
         manifest_payload = (
@@ -996,11 +1199,17 @@ class Pipeline:
         )
         # 分单/舱单写 documents.json，候选写 candidates.json（同一事实只存一份）
         save_documents(self.store, task_id, house_bills, manifest_document, warnings)
+        manifest_lines = len(manifest_document.entries) if manifest_document else 0
+        if manifest_document is not None:
+            summary_text = (
+                f"抽取完成：舱单 {manifest_lines} 行，已转换为 {len(house_bills)} 份分单"
+            )
+        else:
+            summary_text = f"抽取完成：分单 {len(house_bills)} 份"
         await self._emit(
             state,
-            "抽取分单与舱单字段",
-            f"抽取完成：分单 {len(house_bills)} 份、舱单 "
-            f"{len(manifest_document.entries) if manifest_document else 0} 行",
+            "抽取分单或舱单字段",
+            summary_text,
             84,
         )
         return {
@@ -1022,50 +1231,52 @@ class Pipeline:
                 "warnings": [*state.get("warnings", []), *cached.get("warnings", [])],
             }
 
-        manifest_payload = state.get("manifest")
-        manifest = (
-            ManifestDocument(**manifest_payload) if manifest_payload else None
-        )
+        # 需求变更：不再做分单/舱单一致性核对。
+        # 有舱单时「分单」本身就是舱单行转换来的，两侧是同一份数据，比对恒为一致；
+        # 只有分单时也没有另一侧可比。仍然落一份空 comparisons.json，
+        # 保证结果结构（前端摘要/页签）与断点续跑判定稳定。
         house_bills = list(state.get("house_bills") or [])
-        comparisons, summary, compare_warnings = compare(house_bills, manifest)
-        totals = compare_totals(house_bills, manifest)
-        warnings = [*(state.get("warnings") or []), *compare_warnings]
-        totals_failed = [item for item in totals if item.status != "match"]
-
+        # 舱单行数仍要计数：前端的 manifest_entry_count 取自这里（canView / 摘要都用）
+        manifest_payload = state.get("manifest") or {}
+        manifest_entries = manifest_payload.get("entries") or []
+        empty_summary = ComparisonSummary(
+            total_house_bills=len(house_bills),
+            total_manifest_entries=len(manifest_entries),
+        )
         payload = {
-            "comparisons": [item.model_dump() for item in comparisons],
-            "totals_checks": [item.model_dump() for item in totals],
-            "summary": summary.model_dump(),
-            "warnings": compare_warnings,
+            "comparisons": [],
+            "totals_checks": [],
+            "summary": empty_summary.model_dump(),
+            "warnings": [],
         }
         self.store.write_json_atomic(comparisons_path, payload)
         await self._emit(
             state,
             "核对分单与舱单",
-            f"核对完成：一致 {summary.consistent} 份、不一致 {summary.inconsistent} 份、"
-            f"信息不全 {summary.incomplete} 份、汇总差异 {len(totals_failed)} 项",
+            "已取消分单/舱单一致性核对",
             92,
-            "warning" if summary.inconsistent or totals_failed else "info",
+            "info",
+            phase="skipped",
         )
         return {
-            "comparisons": payload["comparisons"],
-            "totals_checks": payload["totals_checks"],
+            "comparisons": [],
+            "totals_checks": [],
             "summary": payload["summary"],
-            "warnings": warnings,
+            "warnings": list(state.get("warnings") or []),
         }
 
     # ------------------------------------------------------------------ 6
     async def build_result(self, state: AnalysisState) -> dict[str, Any]:
         task_id = state["task_id"]
-        # 没有分单时图会跳过抽取与核对节点，这里补一条"已跳过"事件供前端展示
-        if not any(
-            item.get("kind") == "house_bill" for item in state.get("segments") or []
-        ):
-            for label in ("抽取分单与舱单字段", "核对分单与舱单"):
-                await self._emit(state, label, "无分单，已跳过", 0, phase="skipped")
+        # 只有主单（既无分单也无舱单）时图会整段跳过抽取与核对，
+        # 这里补"已跳过"事件供前端展示；只有舱单/只有分单的情况由核对节点自己上报。
+        kinds = {item.get("kind") for item in state.get("segments") or []}
+        if "house_bill" not in kinds and "manifest" not in kinds:
+            for label in ("抽取分单或舱单字段", "核对分单与舱单"):
+                await self._emit(state, label, "无分单与舱单，已跳过", 0, phase="skipped")
         pages = [PageRecord(**item) for item in state.get("pages") or []]
         house_bills = [HouseBill(**item) for item in state.get("house_bills") or []]
-        manifest = ManifestDocument(**state["manifest"]) if state.get("manifest") else None
+        # 舱单明细不进结果：结果里只保留转换后的分单；回查见 documents.json
         comparisons = [
             HouseBillComparison(**item) for item in state.get("comparisons") or []
         ]
@@ -1074,10 +1285,7 @@ class Pipeline:
         ]
         review_items = build_review_items(
             house_bills,
-            comparisons,
-            manifest,
             self.settings.review_confidence_threshold,
-            totals_checks,
         )
         result = AnalysisResult(
             task_id=task_id,
@@ -1092,7 +1300,6 @@ class Pipeline:
             segments=[Segment(**item) for item in state.get("segments") or []],
             master_bills=[MasterBillInfo(**item) for item in state.get("master_bills") or []],
             house_bills=house_bills,
-            manifest=manifest,
             comparisons=comparisons,
             totals_checks=totals_checks,
             summary=ComparisonSummary(**state.get("summary") or {}),
@@ -1302,6 +1509,66 @@ class Pipeline:
             warnings.append(
                 f"{FIELD_LABELS.get(key, key)}位于 Handling Information 栏，已清空"
             )
+        return warnings
+
+    def _correct_emails(
+        self,
+        fields: dict[str, str | None],
+        pdf_path: Path | None,
+        page_map: dict[int, int],
+    ) -> list[str]:
+        """用 PDF 文本层校正收/发货人邮箱，返回告警文案。
+
+        只修「几乎就是同一个串」的情况：同 TLD + 相似度 ≥0.9。
+        这样 `lanshenglght.com` 会改回 `lanshenglight.com`，
+        而「页面里确实没有这个邮箱」时保持原值，不瞎猜。
+        """
+
+        if pdf_path is None or not page_map:
+            return []
+        if not any(str(fields.get(key) or "").strip() for key in EMAIL_KEYS):
+            return []
+
+        try:
+            import pymupdf
+
+            found: list[str] = []
+            with pymupdf.open(pdf_path) as pdf:
+                for page_no in sorted(set(page_map.values())):
+                    if 1 <= page_no <= pdf.page_count:
+                        found.extend(
+                            EMAIL_PATTERN.findall(
+                                pdf.load_page(page_no - 1).get_text()
+                            )
+                        )
+        except Exception as exc:  # noqa: BLE001 - 校正失败不影响主流程
+            logger.warning("邮箱校正读取文本层失败（%s）：%s", pdf_path.name, exc)
+            return []
+        if not found:
+            return []
+
+        pool = {item.lower() for item in found}
+        warnings: list[str] = []
+        for key in EMAIL_KEYS:
+            value = str(fields.get(key) or "").strip()
+            if not value or "@" not in value or value.lower() in pool:
+                continue
+            suffix = value.rsplit(".", 1)[-1].lower()
+            best: str | None = None
+            best_score = 0.0
+            for candidate in found:
+                if candidate.rsplit(".", 1)[-1].lower() != suffix:
+                    continue
+                score = difflib.SequenceMatcher(
+                    None, value.lower(), candidate.lower()
+                ).ratio()
+                if score > best_score:
+                    best, best_score = candidate, score
+            if best is None or best_score < EMAIL_SIMILARITY_THRESHOLD:
+                continue
+            fields[key] = best
+            role = "发货人" if "_fhr_" in key else "收货人"
+            warnings.append(f"{role}邮箱按版面文本校正：{value} → {best}")
         return warnings
 
     def _locate_manifest_fields(

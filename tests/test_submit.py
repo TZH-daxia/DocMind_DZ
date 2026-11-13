@@ -45,7 +45,9 @@ def _submit_payload(request_id: str, acknowledged: bool) -> SubmitRequest:
     )
 
 
-async def test_submit_requires_acknowledgement_when_inconsistent(settings, tmp_path):
+async def test_submit_without_ack_when_no_inconsistency(settings, tmp_path):
+    """取消分单/舱单核对后不再有差异，提交不需要人工确认。"""
+
     pdf = write_pdf(
         tmp_path / "bundle.pdf",
         [MASTER_PAGE, house_page("HAWB0001"), house_page("HAWB0002"), MANIFEST_PAGE],
@@ -55,13 +57,9 @@ async def test_submit_requires_acknowledgement_when_inconsistent(settings, tmp_p
         UploadedDocument(filename="bundle.pdf", content=pdf.read_bytes())
     )
     await _run_task(service, snapshot.task_id)
-    assert service.get_snapshot(snapshot.task_id).inconsistent_count == 1
+    assert service.get_snapshot(snapshot.task_id).inconsistent_count == 0
 
-    with pytest.raises(TaskError) as excinfo:
-        service.submit(snapshot.task_id, _submit_payload("req-1", acknowledged=False))
-    assert excinfo.value.code == "DIFF_NOT_ACKNOWLEDGED"
-
-    response = service.submit(snapshot.task_id, _submit_payload("req-1", acknowledged=True))
+    response = service.submit(snapshot.task_id, _submit_payload("req-1", acknowledged=False))
     assert response.ok is True
     assert response.submission_code.startswith("DZ")
     assert response.duplicated is False

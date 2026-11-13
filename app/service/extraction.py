@@ -40,6 +40,7 @@ from app.service.ports import normalize_port_fields
 logger = logging.getLogger(__name__)
 
 PAGE_HEADER = "<<<PAGE {index}>>>"
+
 # 分单页会同时带「局部精读 + 整页转写」，上限放宽；仍保留截断防止超长页打爆上下文
 MAX_PAGE_CHARS = 12000
 
@@ -57,16 +58,7 @@ FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "weight": ("zdweight", "rcp_gross_weight", "rcp_weight", "gross_weight", "重量", "毛重"),
     "volume": ("zdvolume", "rcp_volume", "declared_volume", "cbm", "体积"),
     "currency": ("currency_code", "ccy", "币种", "货币"),
-    "declarecustom": (
-        "declared_value_carriage",
-        "declared_value",
-        "dvc",
-        "declared_value_for_carriage",
-        "申报价值",
-        "声明价值",
-    ),
     "handlinginfo": ("handling_info", "handling_information", "handling", "操作信息", "处理信息"),
-    "chargeable_weight": ("jfweight", "chargeable", "chg_weight", "cw", "计费重量"),
     "ratelevel": ("rate_class", "rateclass", "class", "运价类别"),
     "rate": ("rate_charge", "unit_price", "unitprice", "单价"),
     "ratetotal": ("rate_total", "total", "total_charge", "amount", "总价", "总额"),
@@ -283,11 +275,8 @@ async def extract_manifest(gateway, pages: list[PageRecord], indexes: list[int])
     if not isinstance(entries, list):
         raise ExtractionError("EXTRACT_INVALID", "舱单抽取结果缺少 entries 数组")
 
-    master_source: dict[str, Any] | None = (
-        payload["master"] if isinstance(payload.get("master"), dict) else None
-    )
-
     normalized_entries: list[dict[str, Any]] = []
+    dropped_no_hawb: list[int] = []
     for position, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
             continue
@@ -295,23 +284,35 @@ async def extract_manifest(gateway, pages: list[PageRecord], indexes: list[int])
         raw_fields = entry.get("fields")
         fields_source = raw_fields if isinstance(raw_fields, dict) else entry
         canonical = canonical_payload(fields_source)
-        hawb_no = canonical.get("hawb_no")
-        is_master_row = row_type == "M" or (
-            isinstance(hawb_no, str) and re.fullmatch(r"\d{3}-?\d{8}", hawb_no.strip())
+        hawb_no = str(canonical.get("hawb_no") or "").strip()
+        is_master_row = row_type in {"M", "MAWB", "MASTER", "主单", "总单"} or bool(
+            re.fullmatch(r"\d{3}-?\d{8}", hawb_no)
         )
+        if not is_master_row and not hawb_no:
+            # 分单号是舱单行的主键：没有它就不可能是分单行。
+            # 舱单里这种行是**总运单汇总行**（AWB 号列写的是 MAWB 416-52342905），
+            # 或者是分单号没读出来 —— 两种情况都不能当成舱单数据行输出。
+            is_master_row = True
+            dropped_no_hawb.append(_to_int(entry.get("line_no"), position))
         if is_master_row:
-            # 总运单汇总行：不作为分单行，单独保存用于和分单合计核对
-            if master_source is None:
-                master_source = fields_source
+            # 总运单汇总行 / 读不出分单号的行：不作为分单行输出（也不再保存汇总值，
+            # 一致性核对已取消，汇总块没有消费方）
             continue
+        # 舱单行的收发货人与分单同一套接口字段名（*_fhr_hawb / *_shr_hawb），
+        # 所以这里要展开参与人嵌套对象，否则 20 个当事人字段全是空。
         entry_fields = flatten_party_fields(
-            canonical, keys=MANIFEST_FIELD_KEYS, parties=()
+            canonical, keys=MANIFEST_FIELD_KEYS, parties=("shipper", "consignee")
         )
-        normalize_port_fields(entry_fields, keys=("dest_port",))
+        # 表格转写会把单元格里的换行写成 `|`（列分隔符），落库前统一换成空格，
+        # 与分单的地址/名称口径一致；顺带把多行合并成一行，前端输入框不再出现竖线。
+        entry_fields = {
+            key: _clean_cell_text(value) for key, value in entry_fields.items()
+        }
+        normalize_port_fields(entry_fields, keys=("sfg", "dest_port"))
         normalized_entries.append(
             {
                 "line_no": _to_int(entry.get("line_no"), position),
-                # 舱单只保留核对字段（分单号 + 目的港 + 件数/重量/计费重/体积）
+                # 舱单行字段与分单同构，但只用于展示与核对，不参与 ERP 入库
                 "fields": entry_fields,
                 "confidence": _to_float(
                     entry.get("confidence"), payload.get("confidence", 0.6)
@@ -319,44 +320,15 @@ async def extract_manifest(gateway, pages: list[PageRecord], indexes: list[int])
                 "warnings": _to_warnings(entry.get("warnings")),
             }
         )
+    warnings = _to_warnings(payload.get("warnings"))
+    if dropped_no_hawb:
+        lines = "、".join(str(item) for item in dropped_no_hawb)
+        warnings.append(f"第 {lines} 行没有分单号，已按总运单行跳过")
     return {
         "entries": normalized_entries,
-        "master": _normalize_manifest_master(master_source),
         "confidence": _to_float(payload.get("confidence"), 0.6),
-        "warnings": _to_warnings(payload.get("warnings")),
+        "warnings": warnings,
     }
-
-
-def _normalize_manifest_master(payload: dict[str, Any] | None) -> dict[str, Any] | None:
-    """把舱单总运单（M 行或页头汇总栏）归一成固定字段。"""
-
-    if not isinstance(payload, dict):
-        return None
-    lowered = {str(key).strip().lower(): value for key, value in payload.items()}
-
-    def pick(*names: str) -> str | None:
-        for name in names:
-            value = lowered.get(name)
-            if value in (None, ""):
-                continue
-            text = str(value).strip()
-            if text:
-                return text
-        return None
-
-    master = {
-        "mawb_no": pick(
-            "mawb_no", "mawb", "master_no", "main_no", "hawb_no", "主单号", "总单号"
-        ),
-        "dest_port": pick("dest_port", "mdg", "destination", "dest", "目的地", "目的港"),
-        "pieces": pick("pieces", "zdpiece", "total_pieces", "件数"),
-        "weight": pick("weight", "zdweight", "total_weight", "gross_weight", "重量"),
-        "chargeable_weight": pick(
-            "chargeable_weight", "jfweight", "chargeable", "cw", "计费重量"
-        ),
-        "volume": pick("volume", "zdvolume", "total_volume", "cbm", "volume_m3", "体积"),
-    }
-    return master if any(value for value in master.values()) else None
 
 
 def canonical_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -501,6 +473,20 @@ def _to_float(value: Any, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return min(max(number, 0.0), 1.0)
+
+
+def _clean_cell_text(value: Any) -> str | None:
+    """单元格文本归一：`|` 与换行都变成单个空格。
+
+    舱单是表格，模型常把单元格内的换行写成 `|`（如 `4900 W. HWY 83 | SUITE 103`），
+    直接落库会在地址栏里留下竖线。分单侧没有这个问题，这里对齐同一口径。
+    """
+
+    if value is None:
+        return None
+    text = str(value).replace("|", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
 
 
 def _to_int(value: Any, default: int | None) -> int | None:

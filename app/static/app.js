@@ -1,17 +1,11 @@
-import { api } from "./api.js";
+﻿import { api } from "./api.js";
 import { NODES, REASON_LABEL, STATUS_CLASS, STATUS_LABEL } from "./constants.js";
 import {
   closeSubmitDialog,
   isSubmitDialogOpen,
   openSubmitDialog,
 } from "./dialog.js";
-import {
-  esc,
-  fileTypeTag,
-  fmtDateTime,
-  fmtTime,
-  showToast,
-} from "./ui.js";
+import { esc, fileTypeTag, fmtTime, showToast } from "./ui.js";
 
 const dom = {
   uploadDropzone: document.getElementById("uploadDropzone"),
@@ -20,8 +14,6 @@ const dom = {
   taskCount: document.getElementById("taskCount"),
   refreshButton: document.getElementById("refreshButton"),
   selectedStatus: document.getElementById("selectedStatus"),
-  selectedType: document.getElementById("selectedType"),
-  selectedName: document.getElementById("selectedName"),
   selectedTaskId: document.getElementById("selectedTaskId"),
   progressBar: document.getElementById("progressBar"),
   progressLabel: document.getElementById("progressLabel"),
@@ -112,16 +104,13 @@ function renderTaskList() {
           ? ""
           : STATUS_LABEL[task.status] || task.status;
       if (task.status === "succeeded") {
+        /*
+         * 副标题只显示分单数量：有舱单时舱单行已经转成分单，两者最终都叫「分单」，
+         * 不再单独列差异/舱单行数，避免同一份数据看两遍。
+         */
         const houseCount = task.house_bill_count || 0;
-        detail =
-          houseCount === 0
-            ? "0 分单"
-            : `${houseCount} 分单 · ${
-                task.inconsistent_count > 0
-                  ? `${task.inconsistent_count} 差异`
-                  : "无字段冲突"
-              }`;
-        // 0 分单（只有主单/舱单被跳过）：黄色，既不是正常结果也不是失败
+        detail = `${houseCount} 分单`;
+        // 0 分单（只有主单）：黄色，既不是正常结果也不是失败
         if (houseCount === 0) dot = "warn";
       }
       return `<button class="file-item${active}" data-task-id="${esc(task.task_id)}">
@@ -201,6 +190,11 @@ async function loadResult(taskId) {
     if (taskId !== state.selectedId) return;
     state.result = result;
     renderResult();
+    /*
+     * 运行过程的跳过原因要看 segments（有没有舱单/分单），
+     * 结果加载完必须重绘一次，否则会停留在「无分单，已跳过」这类过期文案上。
+     */
+    renderEvents();
   } catch (error) {
     if (taskId !== state.selectedId) return;
     dom.resultSummary.innerHTML = `<span class="error-text">${esc(error.message)}</span>`;
@@ -223,9 +217,7 @@ function renderSelectedFile() {
   if (!snapshot) {
     dom.selectedStatus.className = "status-pill idle";
     dom.selectedStatus.textContent = hasTask ? "加载中" : "未选择任务";
-    dom.selectedType.textContent = "—";
-    dom.selectedName.textContent = hasTask ? "加载中…" : "请选择左侧任务";
-    dom.selectedTaskId.textContent = "任务 ID 未加载";
+    dom.selectedTaskId.textContent = hasTask ? "加载中…" : "任务 ID 未加载";
     dom.progressBar.style.width = "0%";
     dom.progressPercent.textContent = "0%";
     dom.progressLabel.textContent = "等待运行";
@@ -236,38 +228,78 @@ function renderSelectedFile() {
   dom.selectedStatus.textContent = snapshot.submitted
     ? "已提交"
     : STATUS_LABEL[snapshot.status] || snapshot.status;
-  dom.selectedType.textContent = fileTypeTag(snapshot.source_name);
-  dom.selectedName.textContent = snapshot.source_name;
-  dom.selectedTaskId.textContent = `${snapshot.task_id} · ${fmtDateTime(
-    snapshot.created_at
-  )}`;
+  /* 标题只放任务 ID（不带源文件名、不带创建时间） */
+  dom.selectedTaskId.textContent = snapshot.task_id;
   const progress = snapshot.status === "succeeded" ? 100 : Number(snapshot.progress || 0);
   dom.progressBar.style.width = `${Math.max(0, Math.min(progress, 100))}%`;
   dom.progressPercent.textContent = `${progress}%`;
   dom.progressLabel.textContent = snapshot.step || STATUS_LABEL[snapshot.status];
 }
 
+/* 任务级事件，不是流水线节点，不放进节点列表 */
+const IGNORED_STEPS = new Set(["处理失败"]);
+
+/* 旧任务的节点名兼容：改名前的「抽取分单与舱单字段」并到新名上 */
+const STEP_ALIASES = {
+  抽取分单与舱单字段: "抽取分单或舱单字段",
+};
+
+function stepLabel(step) {
+  return STEP_ALIASES[step] || step;
+}
+
 function nodeRows() {
   const byStep = new Map();
+  const order = [];
   for (const event of state.events) {
-    if (!byStep.has(event.step)) byStep.set(event.step, []);
-    byStep.get(event.step).push(event);
+    const step = stepLabel(event.step);
+    if (!byStep.has(step)) {
+      byStep.set(step, []);
+      order.push(step);
+    }
+    byStep.get(step).push(event);
   }
   const succeeded = state.snapshot?.status === "succeeded";
   const failed = state.snapshot?.status === "failed";
   const failedStep = state.snapshot?.step;
 
-  return NODES.map((label, index) => {
+  /*
+   * 固定渲染 NODES 全部 7 行，再追加事件里出现的未知步骤。
+   *
+   * 条件边跳过、且没有 skipped 事件的节点（典型：只有舱单时的「分单局部精读」）
+   * 也要保留一行，用「已跳过 + 原因」说明为什么没跑 —— 直接隐藏会让用户以为
+   * 这个步骤不存在或漏了日志。
+   */
+  const known = new Set(NODES);
+  const extra = order.filter(
+    (label) => !known.has(label) && !IGNORED_STEPS.has(label)
+  );
+  const labels = NODES.concat(extra);
+
+  return labels.map((label, index) => {
     const events = byStep.get(label) || [];
     const last = events[events.length - 1];
     // 节点耗时由节点完成事件（phase=succeeded/failed）带出
     const finished = [...events].reverse().find((event) => event.duration_ms != null);
     let status = "idle";
-    if (last?.phase === "skipped") {
-      // 图里被条件边跳过的节点（如只有主单时的抽取/核对）
+    let message = last ? last.message : "";
+    let duration = finished ? finished.duration_ms : null;
+
+    /*
+     * 只要这个节点上报过 skipped，就一律按「已跳过」展示。
+     * 典型：一致性核对已经取消，后端仍会先 started、再 skipped、最后 succeeded，
+     * 取最后一条事件会把它画成「成功」，与事实不符。
+     */
+    const skippedEvent = events.find((event) => event.phase === "skipped");
+    if (skippedEvent) {
       status = "skipped";
+      message =
+        label === "核对分单与舱单"
+          ? "已取消一致性核对，分单字段直接取自舱单"
+          : skippedEvent.message || skipReason(label);
+      duration = null;
     } else if (last) {
-      const nextStarted = NODES.slice(index + 1).some((name) => byStep.has(name));
+      const nextStarted = labels.slice(index + 1).some((name) => byStep.has(name));
       if (last.level === "error" || (failed && failedStep === label)) {
         status = "failed";
       } else if (succeeded || nextStarted || finished?.phase === "succeeded") {
@@ -275,19 +307,27 @@ function nodeRows() {
       } else {
         status = "started";
       }
-    } else if (succeeded || failed) {
-      // 任务已结束却没有事件 = 图里被条件边跳过（如只有主单时的局部精读/抽取/核对）
+    } else if (succeeded) {
+      // 任务成功但没有事件 = 路由跳过了这个节点：保留一行并说明原因
       status = "skipped";
+      message = skipReason(label);
+    } else if (failed || state.snapshot?.status === "cancelled") {
+      // 失败/取消后没走到的节点：留着但标「未执行」，不冒充已跳过
+      status = "idle";
+      message = "未执行";
+    } else {
+      // 还没轮到的节点：显示该步骤做什么，而不是干巴巴的「等待执行」
+      message = NODE_HINTS[label] || "等待执行";
     }
-    let message = last ? last.message : "";
-    let duration = finished ? finished.duration_ms : null;
+
     // 暂停/取消后不会再有完成事件：未跑完的节点退回"等待执行"
     const taskStatus = state.snapshot?.status;
     if ((taskStatus === "paused" || taskStatus === "cancelled") && status === "started") {
       status = "idle";
-      message = "";
+      message = "未执行";
       duration = null;
     }
+
     return {
       label,
       status,
@@ -298,6 +338,45 @@ function nodeRows() {
       busy: status === "started",
     };
   });
+}
+
+/* 各节点在「还没跑到」时的一句话说明 */
+const NODE_HINTS = {
+  解析文档: "渲染页图与文本层",
+  "图像转写": "逐页视觉模型转写",
+  "识别主单/分单/舱单": "规则 + 模型判定单据类型",
+  "分单局部精读": "只对分单页做四象限放大转写",
+  "抽取分单或舱单字段": "有舱单只抽舱单、没有舱单才抽分单",
+  "核对分单与舱单": "一致性核对已取消",
+  "生成结果": "装配结果与待审核清单",
+};
+
+/* 任务成功但该节点没有事件时的跳过原因 */
+function skipReason(label) {
+  const kinds = new Set((state.result?.segments || []).map((item) => item.kind));
+  /*
+   * 结果文件可能还没加载完（运行过程先渲染、结果后到），
+   * 这时不能断言「无分单」——用抽取事件的文案兜底判断有没有舱单/分单。
+   */
+  const extractMessage =
+    (state.events.find(
+      (event) => stepLabel(event.step) === "抽取分单或舱单字段" && event.message
+    )?.message || "");
+  const hasManifest =
+    kinds.has("manifest") || /舱单\s*\d+\s*行/.test(extractMessage);
+  const hasHouse = kinds.has("house_bill") || /分单\s*\d+\s*份/.test(extractMessage);
+
+  if (label === "分单局部精读") {
+    if (hasManifest) return "有舱单，以舱单为准，已跳过";
+    if (hasHouse) return "分单页无需精读，已跳过";
+    if (kinds.size > 0) return "无分单，已跳过";
+    return "按路由跳过";
+  }
+  if (label === "抽取分单或舱单字段" && kinds.size === 0 && !hasHouse && !hasManifest) {
+    return "无分单与舱单，已跳过";
+  }
+  if (label === "核对分单与舱单") return "已取消一致性核对";
+  return "已跳过";
 }
 
 function formatDuration(milliseconds) {
@@ -312,15 +391,20 @@ function renderEvents() {
     dom.eventList.innerHTML = '<div class="empty-state">选择左侧任务查看运行过程</div>';
     return;
   }
-  dom.eventList.innerHTML = nodeRows()
+  const rows = nodeRows();
+  if (!rows.length) {
+    dom.eventList.innerHTML = '<div class="empty-state">暂无运行事件</div>';
+    return;
+  }
+  dom.eventList.innerHTML = rows
     .map(
-      (row) => `<div class="event-row">
+      (row) => `<div class="event-row ${row.status}">
         <span class="event-marker ${row.status}"></span>
         <div class="event-copy">
           <strong>${esc(row.label)}</strong>
-          <small class="${row.warning ? "warning-text" : ""}">${esc(
-            row.message || (row.status === "idle" ? "等待执行" : "—")
-          )}</small>
+          <small class="${row.warning ? "warning-text" : ""}${
+            row.status === "skipped" ? " is-skipped" : ""
+          }">${esc(row.message || (row.status === "idle" ? "等待执行" : "—"))}</small>
         </div>
         <span class="event-value" title="${row.at ? esc(fmtTime(row.at)) : ""}">${
           row.duration != null
@@ -329,7 +413,9 @@ function renderEvents() {
               ? "已跳过"
               : row.status === "started"
                 ? "进行中"
-                : ""
+                : row.status === "idle" && row.message !== "未执行"
+                  ? "等待"
+                  : ""
         }</span>
       </div>`
     )
@@ -355,16 +441,6 @@ function compactPayload(result) {
       fields: bill.fields,
       candidates: bill.candidates || [],
     })),
-    manifest: result.manifest
-      ? {
-          page_indexes: result.manifest.page_indexes,
-          master: result.manifest.master,
-          entries: (result.manifest.entries || []).map((entry) => ({
-            line_no: entry.line_no,
-            fields: entry.fields,
-          })),
-        }
-      : null,
     summary: result.summary,
     totals_checks: result.totals_checks,
     review_items: result.review_items,
@@ -382,7 +458,7 @@ function renderResult() {
   }
 
   const summary = result.summary || {};
-  // 这里只放单据数量；一致/差异/待审核/汇总差异由下方的差异清单表达，不再重复计数
+  // 只放单据数量（分单数 + 舱单来源行数）；待审核明细在下方单独一块
   const pills = [
     `<span class="summary-pill">分单 <b>${summary.total_house_bills ?? 0}</b></span>`,
     `<span class="summary-pill">舱单 <b>${summary.total_manifest_entries ?? 0}</b> 行</span>`,
@@ -409,22 +485,25 @@ function renderResult() {
 }
 
 function renderReviewList(result) {
+  // 一致性核对已取消，不再有「差异」；结果区只保留待审核并整行铺满
   const items = result.review_items || [];
-  const diffs = items.filter((item) => item.reason === "mismatch");
-  const pending = items.filter((item) => item.reason !== "mismatch");
   const warnings = result.warnings || [];
+  const summary = result.summary || {};
   const hasHouse = (result.house_bills || []).length > 0;
-  // 只有主单/只有舱单：没有可提取的分单，直接把原因提示在列表上方
+  /*
+   * 只有「分单和舱单都没抽到」才算没可提取的内容。
+   * 有舱单时舱单行已转成分单，行数看 summary，不能再按「0 分单」判死。
+   */
+  const hasManifest = (summary.total_manifest_entries || 0) > 0;
   const notice =
-    !hasHouse && warnings.length
+    !hasHouse && !hasManifest && warnings.length
       ? `<div class="result-notice">
-          <strong>没有可提取的分单</strong>
+          <strong>没有可提取的内容</strong>
           <span>${esc(warnings.join("；"))}</span>
         </div>`
       : "";
   dom.reviewArea.innerHTML = `${notice}
-    ${renderReviewBlock("差异", diffs, "failed")}
-    ${renderReviewBlock("待审核", pending, "review")}
+    ${renderReviewBlock("待审核", items, "review")}
   `;
 }
 

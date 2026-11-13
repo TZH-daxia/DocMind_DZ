@@ -104,10 +104,19 @@ class _FakeManifestDestinationGateway:
                     {
                         "line_no": 1,
                         "fields": {
+                            "mawb": "999-12345678",
                             "hawb_no": "HAWB0001",
+                            "sfg": "PVG",
                             "dest_port": "DFW",
+                            "hbh": "K4917",
+                            "hbrq": "2026-10-05",
                             "chargeable_weight": "2061.00",
                             "pieces": "5",
+                            "shipper": {
+                                "name": "SHANGHAI EXAMPLE",
+                                "address": "NO.572 QINGYANG ROAD | KUNSHAN CITY",
+                                "phone": "+86 21 5888 0000",
+                            },
                         },
                     }
                 ]
@@ -116,16 +125,27 @@ class _FakeManifestDestinationGateway:
         )
 
 
-async def test_manifest_keeps_destination_and_chargeable_weight():
-    """舱单口径的 dest_port/chargeable_weight 不能被分单接口名映射吃掉。"""
+async def test_manifest_keeps_new_fields_and_drops_removed_ones():
+    """舱单字段按新口径保留：单号/港口/收发货人；去掉的计费重量不再输出。"""
 
     pages = [PageRecord(index=1, text="CARGO MANIFEST")]
     result = await extract_manifest(_FakeManifestDestinationGateway(), pages, [1])
     fields = result["entries"][0]["fields"]
 
+    assert fields["mawb"] == "999-12345678"
+    assert fields["sfg"] == "PVG"
     assert fields["dest_port"] == "DFW"
-    assert fields["chargeable_weight"] == "2061.00"
+    assert fields["hbh"] == "K4917"
+    assert fields["hbrq"] == "2026-10-05"
     assert fields["pieces"] == "5"
+    # 收发货人嵌套对象要展开成接口字段名（舱单保留原文，不做手机号归一）
+    assert fields["companytitle_fhr_hawb"] == "SHANGHAI EXAMPLE"
+    assert fields["phone_fhr_hawb"] == "+86 21 5888 0000"
+    # 单元格里的 `|` 换行要换成空格，与分单口径一致
+    assert fields["address_fhr_hawb"] == "NO.572 QINGYANG ROAD KUNSHAN CITY"
+    assert not any("|" in (value or "") for value in fields.values())
+    # 计费重量已不再抽取（后端不提供，前端人工填）
+    assert "chargeable_weight" not in fields
 
 
 class _FakeMasterRowGateway:
@@ -190,3 +210,71 @@ def test_house_candidates_keep_evidence_and_missing():
     assert candidates["mdg"]["value"] is None
     # 全部字段都应有候选，缺值字段也不能少
     assert len(result["candidates"]) == len(HOUSE_FIELD_KEYS)
+
+
+class _FakeManifestMasterRowGateway:
+    """模型把总运单汇总行也当成数据行输出（AWB 号列写 MAWB，没有分单号）。"""
+
+    async def complete(self, label, system_prompt, human_prompt):
+        return json.dumps(
+            {
+                "entries": [
+                    {
+                        "line_no": 1,
+                        "fields": {
+                            "mawb": "416-52342905",
+                            "pieces": "42",
+                            "weight": "2776",
+                            "pm": "CONSOLIDATION SHIPMENT DETAILS AS PER ATTACHED MANIFEST",
+                        },
+                    },
+                    {
+                        "line_no": 2,
+                        "fields": {
+                            "mawb": "416-52342905",
+                            "hawb_no": "SZA26100005",
+                            "pieces": "42",
+                            "weight": "2776",
+                            "pm": "FIBER OPTIC PATCHCORD",
+                        },
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+
+async def test_manifest_master_row_without_hawb_is_skipped():
+    """没有分单号的行是总运单汇总行：直接跳过，不再产出 master 汇总块。"""
+
+    pages = [PageRecord(index=1, text="AIR CARGO MANIFEST")]
+    result = await extract_manifest(_FakeManifestMasterRowGateway(), pages, [1])
+
+    assert len(result["entries"]) == 1
+    assert result["entries"][0]["fields"]["hawb_no"] == "SZA26100005"
+    assert "master" not in result
+    assert any("没有分单号" in warning for warning in result["warnings"])
+
+def test_manual_only_fields_are_not_extracted_at_all():
+    """计费重量与申报价值不再抽取：这两个 key 不进入字段表，前端仍可人工填。"""
+
+    from app.service.extraction import _normalize_house_bill_payload
+
+    payload = {
+        "fields": {
+            "hawb": "HAWB0001",
+            "jfweight": "440.0",
+            "declarecustom": "6790.00 USD",
+            "zdpiece": "1",
+        }
+    }
+
+    result = _normalize_house_bill_payload(payload)
+
+    assert "jfweight" not in result["fields"]
+    assert "declarecustom" not in result["fields"]
+    assert result["fields"]["zdpiece"] == "1"
+
+    candidate_keys = {item["field_key"] for item in result["candidates"]}
+    assert "jfweight" not in candidate_keys
+    assert "declarecustom" not in candidate_keys

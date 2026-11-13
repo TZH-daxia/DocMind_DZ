@@ -149,7 +149,6 @@ def save_documents(
             "house_bills": [
                 {
                     "bill_id": bill.bill_id,
-                    "segment_id": bill.segment_id,
                     "page_indexes": bill.page_indexes,
                     "candidates": [
                         candidate.model_dump() for candidate in bill.candidates

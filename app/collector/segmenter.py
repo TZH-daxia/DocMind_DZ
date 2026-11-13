@@ -105,6 +105,11 @@ NOISE_DOC_NOS = {
     "TOTAL",
 }
 
+# 页首的货代运单号：SZA26100005 / WPL26100101（2-4 位字母 + 7-10 位数字）
+HOUSE_HEAD_NO_PATTERN = re.compile(r"\b([A-Z]{2,4}\d{7,10})\b")
+# AWB 页首的主单号：416-52342905 / 416 PVG 52342905 / 41652342905
+HEAD_MAWB_LINE_PATTERN = re.compile(r"^\s*\d{3}\s*[A-Z]{0,3}\s*\d{8}", re.MULTILINE)
+
 
 def normalize_for_match(text: str) -> str:
     """全角转半角、压缩空白，便于正则匹配。"""
@@ -239,6 +244,10 @@ def detect_master_bill(text: str) -> MasterBillSignal:
     master_hits = _hit_labels(MASTER_LABEL_PATTERNS, normalized)
     master_no = find_master_no(normalized)
 
+    # 页首另有货代运单号 → 这是 House AWB，不是航空主单
+    if _house_head_no(_head_lines(normalized), normalized):
+        return MasterBillSignal(False, 0.0, None, [])
+
     evidence: list[str] = []
     if master_hits:
         evidence.append("命中主单标题特征：" + "、".join(master_hits))
@@ -283,6 +292,30 @@ def detect_master_bill(text: str) -> MasterBillSignal:
 def _head_lines(text: str, count: int = 8) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines[:count])
+
+
+def _house_head_no(head: str, text: str) -> str | None:
+    """页首的货代运单号（House AWB 自己的单号）。
+
+    很多 House AWB 不印 "HAWB" 标签，只在页首写一个货代单号（SZA26100005），
+    左上角同时印着航空主单号（416-52342905，常被拆成 `416 PVG 52342905`）。
+    这类页面如果只看 "Air Waybill" 标题 + 主单号，会被判成主单 ——
+    单票模式下就成了「第二个主单」，整单直接失败。
+    """
+
+    house_no: str | None = None
+    for match in HOUSE_HEAD_NO_PATTERN.finditer(head.upper()):
+        value = normalize_doc_no(match.group(1))
+        if value and len(value) >= 9:
+            house_no = value
+            break
+    if not house_no:
+        return None
+    # 必须是 AWB 版式：页首有主单号（允许被拆开），或整页带 Air Waybill 标题
+    has_awb_layout = bool(HEAD_MAWB_LINE_PATTERN.search(head.upper())) or bool(
+        re.search(r"AIR\s+WAYBILL", text, re.IGNORECASE)
+    )
+    return house_no if has_awb_layout else None
 
 
 def _has_manifest_title(head: str) -> bool:
@@ -360,6 +393,21 @@ def classify_page_by_rules(text: str, previous_kind: DocKind | None) -> PageKind
     master_signal = detect_master_bill(normalized)
     manifest_score = _score_manifest(normalized, head)
     house_score = _score_house(normalized, head, hawb_no)
+
+    # House AWB 判定要先于「主单」：这类页面同样印着 "Air Waybill" 和主单号，
+    # 但页首那个货代单号（SZA26100005）说明它是分单。
+    # 注意不能在舱单特征明显的页面上抢判（舱单表头同样有 HAWB 列）。
+    house_head_no = _house_head_no(head, normalized) if manifest_score < 4 else None
+    if house_head_no:
+        return PageKind(
+            index=0,
+            kind="house_bill",
+            doc_no=house_head_no,
+            confidence=0.9,
+            evidence=[
+                f"页首出现分单号 {house_head_no}（AWB 版式，主单号另印在页首）"
+            ],
+        )
 
     if manifest_score >= 4 and manifest_score >= house_score:
         return PageKind(

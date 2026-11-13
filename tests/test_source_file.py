@@ -41,6 +41,57 @@ def test_source_document_missing_task(settings) -> None:
         service.source_document("task_not_exists")
 
 
+def test_single_mode_lists_and_streams_all_sources(settings) -> None:
+    """单票多文件：清单给出全部原件，按 index 能逐个下载到对应字节。"""
+
+    service = make_service(settings)
+    snapshot = service.create_task(
+        [
+            UploadedDocument(filename="a.pdf", content=b"%PDF-1.4 first"),
+            UploadedDocument(filename="b.pdf", content=b"%PDF-1.4 second"),
+        ],
+        mode="single",
+    )
+
+    app = create_app()
+    app.dependency_overrides[dependencies.get_task_service] = lambda: service
+    client = TestClient(app)
+    base = f"{get_settings().api_prefix}/analysis/tasks/{snapshot.task_id}"
+
+    listing = client.get(f"{base}/files")
+    assert listing.status_code == 200
+    items = listing.json()
+    assert [item["index"] for item in items] == [1, 2]
+    assert [item["name"] for item in items] == ["a.pdf", "b.pdf"]
+
+    second = client.get(f"{base}/files/2")
+    assert second.status_code == 200
+    assert second.content == b"%PDF-1.4 second"
+    assert "b.pdf" in second.headers["content-disposition"]
+
+    # 老接口仍只返回第一个，保持兼容
+    legacy = client.get(f"{base}/file")
+    assert legacy.content == b"%PDF-1.4 first"
+
+
+def test_single_mode_keeps_duplicate_names_apart(settings) -> None:
+    """同名单证不会互相覆盖：落盘改名，清单里也是两个不同的名字。"""
+
+    service = make_service(settings)
+    snapshot = service.create_task(
+        [
+            UploadedDocument(filename="a.pdf", content=b"%PDF-1.4 one"),
+            UploadedDocument(filename="a.pdf", content=b"%PDF-1.4 two"),
+        ],
+        mode="single",
+    )
+
+    items = service.source_documents(snapshot.task_id)
+    assert len(items) == 2
+    assert items[0][0] != items[1][0]
+    assert [name for _, name in items] == ["a.pdf", "a_2.pdf"]
+
+
 def test_file_route_streams_source_with_filename(settings) -> None:
     """HTTP 层：原样返回字节，并把文件名放进 Content-Disposition。"""
 

@@ -153,20 +153,53 @@ class TaskService:
     # ------------------------------------------------------------ 创建/启动
     def create_task(
         self,
-        upload: UploadedDocument,
+        upload: UploadedDocument | list[UploadedDocument],
         context: dict[str, Any] | None = None,
+        *,
+        mode: str = "batch",
     ) -> TaskSnapshot:
-        """一个文件一个任务：不接受文件列表，多个文件由前端分多次上传。"""
+        """创建任务。
 
-        self._validate_upload(upload)
+        识别方式由接口显式传入 `mode`（不做后端猜测）：
+        - `single`：单票，同一主单的多个文件合成**一个任务**，识别出多个主单即失败；
+        - `batch` ：批量，一个文件一个任务（沿用原逻辑，因此只接受单文件）。
+        """
 
-        task_id = self.store.new_task_id(upload.filename)
-        path = self.store.save_upload(task_id, upload)
+        uploads = list(upload) if isinstance(upload, list) else [upload]
+        if not uploads:
+            raise TaskError("FILE_EMPTY", "未收到上传文件")
+        if mode not in ("single", "batch"):
+            raise TaskError("INVALID_MODE", f"未知的识别方式：{mode}")
+        if mode == "batch" and len(uploads) > 1:
+            raise TaskError(
+                "BATCH_MODE_SINGLE_FILE",
+                "批量识别一次只能上传一个文件，多个文件请分多次上传",
+            )
+        for item in uploads:
+            self._validate_upload(item)
+
+        task_id = self.store.new_task_id(uploads[0].filename)
+        paths = self.store.save_uploads(task_id, uploads)
+        # 展示名优先用原始文件名；同名文件被落盘改名（a.pdf / a_2.pdf）时用落盘名，
+        # 否则附件库里会出现两个同名文件，人工无法区分。
+        files: list[dict[str, str]] = []
+        used_names: set[str] = set()
+        for item, path in zip(uploads, paths, strict=False):
+            name = Path(item.filename or path.name).name
+            if name in used_names:
+                name = path.name
+            used_names.add(name)
+            files.append({"name": name, "path": str(path)})
+        source_name = (
+            files[0]["name"]
+            if len(files) == 1
+            else f"{files[0]['name']} 等 {len(files)} 个文件"
+        )
 
         created_at = datetime.now().astimezone()
         status = {
             "task_id": task_id,
-            "source_name": Path(upload.filename or path.name).name,
+            "source_name": source_name,
             "status": "queued",
             "progress": 0,
             "step": "已排队",
@@ -177,19 +210,30 @@ class TaskService:
             "manifest_entry_count": 0,
             "inconsistent_count": 0,
             "context": context or {},
-            # 原件路径是唯一权威来源（解析节点据此找文件）
-            "uploaded_path": str(path),
+            "mode": mode,
+            # 单票：多个原件；批量：只有一个。解析节点按这个列表逐份解析
+            "files": files,
+            # 原件路径是唯一权威来源（单文件场景/历史任务仍读它）
+            "uploaded_path": files[0]["path"],
         }
         self._write_status(task_id, status)
-        logger.info("创建任务 %s（%s）", task_id, status["source_name"])
+        logger.info(
+            "创建任务 %s（%s，%s，%s 个文件）",
+            task_id,
+            status["source_name"],
+            mode,
+            len(files),
+        )
         return TaskSnapshot(**status)
 
     def create_and_start(
         self,
-        upload: UploadedDocument,
+        upload: UploadedDocument | list[UploadedDocument],
         context: dict[str, Any] | None = None,
+        *,
+        mode: str = "batch",
     ) -> TaskSnapshot:
-        snapshot = self.create_task(upload, context)
+        snapshot = self.create_task(upload, context, mode=mode)
         self.start(snapshot.task_id)
         return snapshot
 
@@ -312,6 +356,9 @@ class TaskService:
             "source_name": status.get("source_name", ""),
             "context": status.get("context") or {},
             "created_at": status.get("created_at"),
+            "mode": status.get("mode") or "batch",
+            # 单票多文件：解析节点按这个列表逐份解析（为空则退回 uploaded_path）
+            "files": status.get("files") or [],
             "reporter": TaskReporter(self, task_id),
             "completed_nodes": self._completed_nodes(task_id),
         }
@@ -356,7 +403,12 @@ class TaskService:
         return dict(state)
 
     def _completed_nodes(self, task_id: str) -> list[str]:
-        """按磁盘产物推断已完成节点，仅返回连续前缀，避免跳节点。"""
+        """按磁盘产物推断已完成节点，仅返回连续前缀，避免跳节点。
+
+        判据跟着「节点有没有真的产出」走，而不是「有没有分单」：
+        只有舱单的任务也要走抽取节点（只是跳过核对），所以不能用
+        「无分单 → 抽取/核对都算完成」的老口径。
+        """
 
         completed: list[str] = []
         doc = self.store.read_json_or_none(self.store.document_path(task_id)) or {}
@@ -373,28 +425,31 @@ class TaskService:
             completed.append("classify_pages")
         else:
             return completed
-        house_indexes = [
-            index
-            for segment in segments
-            if segment.get("kind") == "house_bill"
-            for index in segment.get("page_indexes") or []
-        ]
-        if not house_indexes:
-            # 只有主单/舱单：路由会跳过局部精读、抽取与核对，视为全部完成
+
+        kinds = {segment.get("kind") for segment in segments}
+        # 只有主单：路由直接跳到结果装配，局部精读/抽取/核对都不执行
+        if "house_bill" not in kinds and "manifest" not in kinds:
             completed.extend(
                 ["transcribe_house_zoom", "extract_documents", "verify_consistency"]
             )
             return completed
-        if self.store.zoom_status_path(task_id).exists():
-            completed.append("transcribe_house_zoom")
-        else:
+
+        # 有分单且没有舱单才做局部精读；有舱单时（以舱单为准）该节点被路由跳过
+        if (
+            "house_bill" in kinds
+            and "manifest" not in kinds
+            and not self.store.zoom_status_path(task_id).exists()
+        ):
             return completed
-        if self.store.documents_path(task_id).exists():
-            completed.append("extract_documents")
-        else:
+        completed.append("transcribe_house_zoom")
+        if not self.store.documents_path(task_id).exists():
             return completed
-        if self.store.comparisons_path(task_id).exists():
-            completed.append("verify_consistency")
+        completed.append("extract_documents")
+        # 核对节点在「只有分单」或「只有舱单」时会写一份空 comparisons.json，
+        # 所以文件存在即视为已完成，续跑不会重复进这个节点
+        if not self.store.comparisons_path(task_id).exists():
+            return completed
+        completed.append("verify_consistency")
         return completed
 
     async def _fail(self, task_id: str, code: str, message: str) -> None:
@@ -440,7 +495,14 @@ class TaskService:
             # 冻结态（暂停/终态）只追加时间线，不再改写状态，避免收尾事件覆盖
             if status.get("status") not in FROZEN_STATUSES:
                 status["step"] = step
-                status["progress"] = max(int(status.get("progress") or 0), event.progress)
+                # 进度只在节点边界推进（started/succeeded/skipped）。
+                # 节点内部的事件（逐页转写、逐份分单抽取等）只进时间线，
+                # 不参与进度计算 —— 否则同一节点内进度会随分页数跳变，
+                # 看起来不是「按节点完成」。
+                if phase:
+                    status["progress"] = max(
+                        int(status.get("progress") or 0), event.progress
+                    )
                 self._write_status(task_id, status)
 
     def _next_seq(self, task_id: str) -> int:
@@ -620,6 +682,27 @@ class TaskService:
             )
 
         return {"schema_version": 1, "task_id": task_id, "bills": bills}
+
+    def source_documents(self, task_id: str) -> list[tuple[Path, str]]:
+        """用户上传的**全部**原件（单票可能是多个），按上传顺序。
+
+        单票多文件时 `/file` 只能返回第一个，ERP 侧归档要逐个取，
+        所以这里按任务状态里的 `files` 列表遍历；历史任务没有该字段时
+        回落到 `uploaded_path`（等价于单文件）。
+        """
+
+        status = self._read_status(task_id)
+        items: list[tuple[Path, str]] = []
+        for entry in status.get("files") or []:
+            raw = str((entry or {}).get("path") or "").strip()
+            if not raw:
+                continue
+            path = Path(raw)
+            if path.exists():
+                items.append((path, str(entry.get("name") or path.name)))
+        if items:
+            return items
+        return [self.source_document(task_id)]
 
     def source_document(self, task_id: str) -> tuple[Path, str]:
         """用户上传的原件（PDF / 图片 / Office）及其原始文件名。

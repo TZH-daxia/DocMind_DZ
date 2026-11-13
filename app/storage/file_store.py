@@ -65,10 +65,34 @@ class FileStore:
         return directory
 
     def save_upload(self, task_id: str, upload: UploadedDocument) -> Path:
-        filename = self.safe_filename(upload.filename or "document")
-        destination = self.task_dir(task_id) / filename
-        self.write_bytes_atomic(destination, upload.content)
-        return destination
+        return self.save_uploads(task_id, [upload])[0]
+
+    def save_uploads(
+        self, task_id: str, uploads: list[UploadedDocument]
+    ) -> list[Path]:
+        """单票模式：一个任务保存多个原件。
+
+        同名文件自增后缀（a.pdf / a_2.pdf），否则后一个会覆盖前一个，
+        页面图与 page_boundaries 全部错位。
+        """
+
+        saved: list[Path] = []
+        used: set[str] = set()
+        directory = self.task_dir(task_id)
+        for upload in uploads:
+            base = self.safe_filename(upload.filename or "document")
+            stem = Path(base).stem
+            suffix = Path(base).suffix
+            name = base
+            index = 2
+            while name in used:
+                name = f"{stem}_{index}{suffix}"
+                index += 1
+            used.add(name)
+            destination = directory / name
+            self.write_bytes_atomic(destination, upload.content)
+            saved.append(destination)
+        return saved
 
     def write_bytes_atomic(self, destination: Path, content: bytes) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)

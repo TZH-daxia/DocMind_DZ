@@ -211,3 +211,41 @@ def test_notice_page_without_master_no_is_not_master_bill():
     assert signal.is_master is False
     kind = classify_page_by_rules(NOTICE_PAGE, previous_kind=None)
     assert kind.kind != "master_bill"
+
+
+HOUSE_AWB_PAGE = """Air Waybill
+416 PVG 52342905 SZA26100005
+Shipper's Name and Address
+XDK COMMUNICATION EQUIPMENT (HUIZHOU) LTD
+Consignee's Name and Address
+AFL TELECOMMUNICATIONS LLC
+Issued by TCI INTERNATIONAL LOGISTICS (SHANGHAI) LIMITED
+Requested Flight/Date
+"""
+
+
+def test_house_awb_with_forwarder_number_is_house_bill():
+    """页首同时印主单号与货代运单号的 AWB，要判分单而不是主单。
+
+    这种版式没有 "HAWB" 标签，以前会命中 "Air Waybill" + 主单号被判成主单，
+    单票模式下直接触发「多个主单」导致整单失败。
+    """
+
+    kind = classify_page_by_rules(HOUSE_AWB_PAGE, previous_kind=None)
+
+    assert kind.kind == "house_bill"
+    assert kind.doc_no == "SZA26100005"
+    assert detect_master_bill(HOUSE_AWB_PAGE).is_master is False
+
+
+def test_manifest_with_hawb_column_is_not_house_bill():
+    """舱单表头也有 HAWB 列，不能被「页首有货代单号」抢判成分单。"""
+
+    text = """CARGO MANIFEST
+HAWB NO. | ORIGIN | DEST | PCS | G.W.
+WPL26100101 | PVG | DFW | 45 | 6687
+Air Waybill
+"""
+    kind = classify_page_by_rules(text, previous_kind=None)
+
+    assert kind.kind == "manifest"

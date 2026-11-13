@@ -59,7 +59,6 @@ def test_candidate_without_any_quote_is_not_downgraded():
 def test_candidate_needs_review_enters_review_list():
     bill = HouseBill(
         bill_id="bill_001",
-        segment_id="seg_001",
         page_indexes=[1],
         fields={"hawb": "HAWB0001", "pm": "GOODS"},
         candidates=[
@@ -74,10 +73,33 @@ def test_candidate_needs_review_enters_review_list():
         ],
     )
 
-    items = build_review_items([bill], [], None)
+    items = build_review_items([bill])
     target = [item for item in items if item.key == "pm"]
 
     assert target
     assert target[0].reason == "low_confidence"
     assert "原文引用" in target[0].message
     assert target[0].evidence == "NATURE AND QUANTITY GOODS"
+
+
+def test_stitched_hbrq_quote_is_marked_for_review():
+    """航班日期引用用 `...` 拼了两处原文：即使片段能命中，也要标待审核并说明原因。"""
+
+    pages = [
+        PageRecord(index=1, text="GUADALAJARA 5Y518/22 XXX\n21/OCT/2026 TIANJIN")
+    ]
+    candidates = [
+        {
+            "field_key": "hbrq",
+            "value": "2026-10-22",
+            "status": "confirmed",
+            "confidence": 0.9,
+            "evidence": [{"quote": "5Y518/22 ... 21/OCT/2026 TIANJIN"}],
+            "warnings": [],
+        }
+    ]
+
+    updated, _ = _validate_candidates(pages, [1], candidates)
+
+    assert updated[0]["status"] == "needs_review"
+    assert any("拼接" in item for item in updated[0]["warnings"])

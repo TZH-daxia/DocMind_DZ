@@ -18,7 +18,7 @@ NODE_SEQUENCE: tuple[tuple[str, str, int], ...] = (
     ("classify_pages", "识别主单/分单/舱单", 45),
     # 先整页转写并分类，再只对分单页做四象限局部精读（小字特写）
     ("transcribe_house_zoom", "分单局部精读", 48),
-    ("extract_documents", "抽取分单与舱单字段", 55),
+    ("extract_documents", "抽取分单或舱单字段", 55),
     ("verify_consistency", "核对分单与舱单", 85),
     ("build_result", "生成结果", 95),
 )
@@ -35,13 +35,18 @@ def _first_pending_node(state: AnalysisState) -> str:
 
 
 def _route_after_classify(state: AnalysisState) -> str:
-    """没有分单段（例如整份文件只有主单）时，直接跳到结果装配。
+    """分类后的三种走向：
 
-    主单只登记不抽取，继续走局部精读/抽取/核对节点没有意义，日志里也不该出现这几步。
+    - 有分单：先做局部精读，再抽取；
+    - 只有舱单：跳过局部精读（那是分单专用），但**必须**进抽取节点把舱单字段抽出来；
+    - 只有主单（没有分单也没有舱单）：主单只登记不抽取，直接装配结果。
     """
 
-    segments = state.get("segments") or ()
-    if any(item.get("kind") == "house_bill" for item in segments):
+    kinds = {item.get("kind") for item in state.get("segments") or ()}
+    # 有舱单时以舱单为准：分单页不再抽取，也就不需要分单精读，直接进抽取节点
+    if "manifest" in kinds:
+        return "extract_documents"
+    if "house_bill" in kinds:
         return "transcribe_house_zoom"
     return "build_result"
 
@@ -76,6 +81,7 @@ class AnalysisGraph:
                     _route_after_classify,
                     {
                         "transcribe_house_zoom": "transcribe_house_zoom",
+                        "extract_documents": "extract_documents",
                         "build_result": "build_result",
                     },
                 )

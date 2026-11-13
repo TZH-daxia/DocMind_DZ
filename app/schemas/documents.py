@@ -99,7 +99,8 @@ class FieldCandidate(BaseModel):
 
 class HouseBill(BaseModel):
     bill_id: str
-    segment_id: str
+    # 数据来源：house_bill=分单页抽取；manifest=由舱单行转换（以舱单为准）
+    source: Literal["house_bill", "manifest"] = "house_bill"
     page_indexes: list[int] = Field(default_factory=list)
     fields: dict[str, str | None] = Field(default_factory=dict)
     # 字段在原图中的位置：key → [{page, bbox:[x,y,w,h]}]，供前端点击字段时高亮
@@ -109,7 +110,6 @@ class HouseBill(BaseModel):
     # 字段级候选（含 missing），便于对照「转写 vs 提取」与逐字段复核
     candidates: list[FieldCandidate] = Field(default_factory=list)
     confidence: float = 0.6
-    warnings: list[str] = Field(default_factory=list)
     source_excerpt: str = ""
 
 
@@ -124,22 +124,10 @@ class ManifestEntry(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-class ManifestMaster(BaseModel):
-    """舱单里的总运单（主单）汇总行：用于和分单合计值核对。"""
-
-    mawb_no: str | None = None
-    dest_port: str | None = None
-    pieces: str | None = None
-    weight: str | None = None
-    chargeable_weight: str | None = None
-    volume: str | None = None
-
-
 class ManifestDocument(BaseModel):
     segment_id: str
     page_indexes: list[int] = Field(default_factory=list)
     entries: list[ManifestEntry] = Field(default_factory=list)
-    master: ManifestMaster | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -213,8 +201,9 @@ class AnalysisResult(BaseModel):
     pages: list[PageRecord] = Field(default_factory=list)
     segments: list[Segment] = Field(default_factory=list)
     master_bills: list[MasterBillInfo] = Field(default_factory=list)
+    # 注意：结果里只有分单（有舱单时由舱单行转换而来），不再重复输出舱单明细；
+    # 舱单原始抽取仍保存在 data/tasks/<id>/documents.json，行数见 summary.total_manifest_entries
     house_bills: list[HouseBill] = Field(default_factory=list)
-    manifest: ManifestDocument | None = None
     comparisons: list[HouseBillComparison] = Field(default_factory=list)
     totals_checks: list[TotalsCheck] = Field(default_factory=list)
     summary: ComparisonSummary = Field(default_factory=ComparisonSummary)
@@ -245,6 +234,10 @@ class TaskSnapshot(BaseModel):
     submitted_at: datetime | None = None
     submission_code: str | None = None
     context: dict[str, Any] = Field(default_factory=dict)
+    # 识别方式：single=单票（同一主单的多个文件合成一个任务）；batch=批量（一个文件一个任务）
+    mode: Literal["single", "batch"] = "batch"
+    # 单票模式下的原件清单：[{name, path}]；批量模式只有一个元素
+    files: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class WorkflowEvent(BaseModel):
