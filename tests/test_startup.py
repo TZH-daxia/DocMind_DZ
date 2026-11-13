@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from app.config import Settings, _local_ipv4_addresses
+from app.logging_config import daily_log_path
 from app.main import _display_hosts, format_startup_banner
 
 
@@ -24,7 +25,11 @@ def test_startup_banner_lists_addresses_and_paths(tmp_path: Path) -> None:
     assert "http://127.0.0.1:8010/" in banner
     assert "http://127.0.0.1:8010/docs" in banner
     assert "http://127.0.0.1:8010/health" in banner
-    assert str((tmp_path / "logs" / "app.log").resolve()) in banner
+    # 日志文件名带日期：系统日志那一行指向当天文件，不再是无日期的 app.log
+    assert str(daily_log_path(tmp_path / "logs").resolve()) in banner
+    log_line = next(line for line in banner.splitlines() if "系统日志：" in line)
+    assert log_line.rstrip().endswith(daily_log_path(tmp_path / "logs").name)
+    assert "app.log.YYYY-MM-DD" in banner
     assert str((tmp_path / "data" / "tasks").resolve()) in banner
     # 模型模式不再展示在终端横幅里（改由启动日志记录）
     assert "模型模式" not in banner

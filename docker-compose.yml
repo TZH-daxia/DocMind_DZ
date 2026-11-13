@@ -59,7 +59,7 @@ services:
           # 需要给宿主机留出明确余量时再打开，值建议 = CPU 核数
           # cpus: "4.0"
     logging:
-      # 容器 stdout 只有启动横幅与少量告警；应用日志写在宿主机 ./logs/app.log
+      # 容器 stdout 只有启动横幅与少量告警；应用日志写在宿主机 ./logs/app.log.YYYY-MM-DD（按天）
       driver: json-file
       options:
         max-size: "10m"

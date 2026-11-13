@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api.dependencies import get_task_service
 from app.api.routes.analysis import router as analysis_router
 from app.config import Settings, _local_ipv4_addresses, get_settings
-from app.logging_config import LOG_FILE_NAME, configure_logging
+from app.logging_config import LOG_FILE_PREFIX, configure_logging, daily_log_path
 from app.service.task_service import TaskService
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,8 @@ def format_startup_banner(current: Settings) -> str:
     port = current.app_port
     hosts = _display_hosts(current.app_host)
     primary = hosts[0]
-    log_path = (Path(current.log_dir) / LOG_FILE_NAME).resolve()
+    log_dir = Path(current.log_dir).resolve()
+    log_path = daily_log_path(log_dir).resolve()
     data_path = Path(current.data_root).resolve()
     # 实时看日志的命令随平台给出：部署在 Linux 容器里时 PowerShell 写法不可用
     watch_log = (
@@ -93,8 +94,8 @@ def format_startup_banner(current: Settings) -> str:
             f"  接口文档：http://{primary}:{port}/docs",
             f"  健康检查：http://{primary}:{port}/health",
             f"  系统日志：{log_path}",
-            f"  任务数据：{data_path / 'tasks'}",
-            f"  （实时查看日志：{watch_log}）",
+            f"  （历史日志：{log_dir / (LOG_FILE_PREFIX + '.YYYY-MM-DD')}，"
+            f"按日期递增保留 {current.log_retention_days} 天）",
         ]
     )
     return "\n".join(lines)

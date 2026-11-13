@@ -41,7 +41,7 @@ DocMind DZ 自带入口容器并换用备用端口，从而完全不依赖、也
 | 接口前缀 | `/docmind` | `/docmind_dz` | nginx `location` 与接口基址跟着改 |
 | 应用端口 | 8000 | 8010 | Dockerfile / compose / healthcheck 全部改 |
 | 环境变量前缀 | `DOCMIND_` | `DOCMIND_DZ_` | Dockerfile `ENV` 全部改名 |
-| 日志配置 | `DOCMIND_SYSTEM_LOG_FILE`（文件路径） | `DOCMIND_DZ_LOG_DIR`（**目录**） | 容器内 `/app/logs`，文件名固定 `app.log` |
+| 日志配置 | `DOCMIND_SYSTEM_LOG_FILE`（文件路径） | `DOCMIND_DZ_LOG_DIR`（**目录**） | 容器内 `/app/logs`，文件名按天 `app.log.YYYY-MM-DD` |
 | LibreOffice | 需要 `python3-uno`（XLS 行高修正脚本） | 只用 `soffice` 命令行转 PDF | 只装 `libreoffice-writer/calc`，不装 uno |
 | 上传体积 | 单文件 50MB | 一次最多 5 个文件 × 50MB | `client_max_body_size` 从 50m 提到 **256m** |
 | 前端 | 联调用，公网 404 | 同为联调用，公网 404 | 一致 |
@@ -153,7 +153,7 @@ docker compose ps
 ```bash
 docker compose logs docmind-dz | tail -n 20                  # 启动横幅与模型就绪情况
 docker exec docmind-dz-gateway nginx -t                      # nginx 配置自检
-docker compose exec docmind-dz tail -n 30 /app/logs/app.log  # 应用日志
+docker compose exec docmind-dz tail -n 30 "$(ls -t /app/logs/app.log.* | head -1)"  # 应用日志（当天文件）
 ```
 
 启动横幅会直接打在容器 stdout 上，能看到访问地址、日志与数据目录：
@@ -164,9 +164,10 @@ DocMind DZ 已启动
   局域网访问：http://172.18.0.2:8010/
   接口文档：http://127.0.0.1:8010/docs
   健康检查：http://127.0.0.1:8010/health
-  系统日志：/app/logs/app.log
+  系统日志：/app/logs/app.log.2026-11-13
   任务数据：/app/data/tasks
-  （实时查看日志：tail -f /app/logs/app.log）
+  （实时查看日志：tail -f /app/logs/app.log.2026-11-13）
+  （历史日志：/app/logs/app.log.YYYY-MM-DD，按日期递增保留 14 天）
 ```
 
 > 横幅里的地址是**容器内视角**，公网入口是 `:8444/docmind_dz`，别照着横幅去访问。
@@ -290,8 +291,8 @@ DOCMIND_DZ_OFFICE_CONCURRENCY=1      # soffice 单实例，必须串行
 
 | 事项 | 命令 / 说明 |
 |---|---|
-| 应用日志 | `docker compose exec docmind-dz tail -f /app/logs/app.log`（容器 stdout 只有启动横幅与少量告警） |
-| 日志轮转 | 按天轮转成 `logs/app.log.YYYY-MM-DD`，保留 14 天（`DOCMIND_DZ_LOG_RETENTION_DAYS`） |
+| 应用日志 | `docker compose exec docmind-dz tail -f "$(ls -t /app/logs/app.log.* | head -1)"`（容器 stdout 只有启动横幅与少量告警） |
+| 日志文件 | 按天写 `logs/app.log.YYYY-MM-DD`（**不生成无日期的 `app.log`**），按文件名排序即日期递增、最新一天在最下；保留 14 天（`DOCMIND_DZ_LOG_RETENTION_DAYS`） |
 | 网关日志 | `docker compose logs docmind-dz-gateway` |
 | 改 nginx 配置 | 改 `deploy/nginx/docmind_dz.conf`，然后 `docker exec docmind-dz-gateway nginx -t && docker exec docmind-dz-gateway nginx -s reload` |
 | 升级 | `git pull && docker compose up -d --build`，**挑没人跑任务时**——重启会把在途任务标记为中断 |
@@ -299,7 +300,7 @@ DOCMIND_DZ_OFFICE_CONCURRENCY=1      # soffice 单实例，必须串行
 | 数据位置 | `./data/tasks/<task_id>/`（原件、页面图、任务日志）、`./data/results/`；默认保留 24 小时（与托书识别一致），**启动时清一次、之后每小时清一次** |
 | 磁盘 | `df -h /data`；清理用 `rm -rf data/tasks/*`（属主是 10001，root 可删） |
 | 停止 | `docker compose down`（本项目的容器与网络，不影响 DocMind 等其它项目） |
-| 模型兜底 | 主模型整轮重试失败时自动切到兜底 provider。日志关键字：`兜底`、`熔断`。排查用 `grep -E "provider|熔断|兜底" logs/app.log` |
+| 模型兜底 | 主模型整轮重试失败时自动切到兜底 provider。日志关键字：`兜底`、`熔断`。排查用 `grep -E "provider|熔断|兜底" logs/app.log.*` |
 | 关闭兜底 | 不配 `DOCMIND_DZ_FALLBACK_API_KEY`（或置空）即完全不启用 |
 
 ---
@@ -308,7 +309,7 @@ DOCMIND_DZ_OFFICE_CONCURRENCY=1      # soffice 单实例，必须串行
 
 | 现象 | 原因 / 排查 |
 |---|---|
-| 容器起不来，日志里 `Permission denied: '/app/logs/app.log'` | 漏了 `mkdir -p data logs && chown -R 10001:10001 data logs` |
+| 容器起不来，日志里 `Permission denied: '/app/logs/app.log.YYYY-MM-DD'` | 漏了 `mkdir -p data logs && chown -R 10001:10001 data logs` |
 | `127.0.0.1:8444` 连接被拒 | gateway 没起来或端口没映射 → `docker compose ps` |
 | 外网**超时**（不是拒绝） | 安全组没放行 8444 |
 | **502 Bad Gateway** | gateway 通了但应用没起来 → `docker compose logs docmind-dz`；两个容器都在跑仍 502，是 gateway 缓存了应用重启前的旧 IP → `docker compose restart gateway` |
