@@ -48,7 +48,7 @@ from app.schemas.documents import (
     Segment,
     TotalsCheck,
 )
-from app.schemas.fields import FIELD_LABELS, HOUSE_FIELD_KEYS
+from app.schemas.fields import FIELD_LABELS, HAWB_UNRECOGNIZED, HOUSE_FIELD_KEYS
 from app.service.extraction import (
     ExtractionError,
     classify_pages_with_llm,
@@ -134,6 +134,47 @@ def _bills_from_manifest(manifest: ManifestDocument) -> list[HouseBill]:
             )
         )
     return bills
+
+
+def _has_master_number(
+    master_bills: list[Any], house_bills: list[Any], manifest: Any
+) -> bool:
+    """是否识别到主单号（MAWB）。
+
+    主单号可能出现在三处，任一处有值就算识别到：
+    - 分类阶段登记的主单页（`master_no`）；
+    - 分单抽取结果里的 `mawb`（AWB 左上角那串）；
+    - 舱单每行的 `mawb` 列。
+
+    需求：**没有主单号就判定失败**（主单号是 ERP 入库的必需条件）。
+    """
+
+    for bill in master_bills or []:
+        number = (
+            bill.get("master_no")
+            if isinstance(bill, dict)
+            else getattr(bill, "master_no", None)
+        )
+        if str(number or "").strip():
+            return True
+
+    for bill in house_bills or []:
+        fields = bill.fields if hasattr(bill, "fields") else (bill.get("fields") or {})
+        if str((fields or {}).get("mawb") or "").strip():
+            return True
+
+    entries: list[Any] = []
+    if manifest is not None:
+        if hasattr(manifest, "entries"):
+            entries = list(manifest.entries)
+        elif isinstance(manifest, dict):
+            entries = list(manifest.get("entries") or [])
+    for entry in entries:
+        fields = entry.fields if hasattr(entry, "fields") else (entry.get("fields") or {})
+        if str((fields or {}).get("mawb") or "").strip():
+            return True
+
+    return False
 
 
 def _is_degenerate_transcription(text: str) -> bool:
@@ -286,7 +327,13 @@ def _validate_candidates(
     missing_quotes = 0
     stale_quotes = 0
     for item in candidates:
-        if not item.get("value"):
+        value = item.get("value")
+        if not value:
+            continue
+        if str(value) == HAWB_UNRECOGNIZED:
+            # 占位值不是真实分单号：标待审核，但不要算成「缺少原文引用」
+            item["status"] = "needs_review"
+            _append_candidate_warning(item, "分单号未识别，已填占位值")
             continue
         quote = ""
         for evidence in item.get("evidence") or []:
@@ -646,25 +693,32 @@ class Pipeline:
 
     # ------------------------------------------------------------------ 2b
     async def transcribe_house_zoom(self, state: AnalysisState) -> dict[str, Any]:
-        """分单页四象限局部精读：分类后只对 house_bill 页做小字特写转写。
+        """局部精读：对分单页或舱单页做四象限小字特写转写。
+
+        有舱单时以舱单为准（分单页不再抽取），所以这时只精读舱单页；
+        没有舱单才精读分单页。舱单通常是整票缩排的表格，小字比分单更糊，
+        同样需要放大精读，否则表格里的号/重量容易读错。
 
         整页转写保留在 page.text，局部精读写入 page.zoom_text，抽取时局部优先。
-        转写 md 与切图都落盘，便于人工对照「转写 vs 提取」；
+        转写 md 落盘便于人工对照「转写 vs 提取」；
         完成记录写在 transcription/zoom.json，断点续跑不会无限重试。
         """
 
         task_id = state["task_id"]
         pages = [PageRecord(**item) for item in state.get("pages") or []]
         segments = [Segment(**item) for item in state.get("segments") or []]
-        house_indexes = sorted(
+        kinds = {segment.kind for segment in segments}
+        target_kind = "manifest" if "manifest" in kinds else "house_bill"
+        doc_label = "舱单" if target_kind == "manifest" else "分单"
+        target_indexes = sorted(
             {
                 index
                 for segment in segments
-                if segment.kind == "house_bill"
+                if segment.kind == target_kind
                 for index in segment.page_indexes
             }
         )
-        if not house_indexes:
+        if not target_indexes:
             return {}
 
         by_index = {page.index: page for page in pages}
@@ -672,7 +726,7 @@ class Pipeline:
         done = (self.store.read_json_or_none(status_path) or {}).get("pages") or {}
         pending = [
             by_index[index]
-            for index in house_indexes
+            for index in target_indexes
             if index in by_index and str(index) not in done
         ]
         if not pending:
@@ -680,8 +734,8 @@ class Pipeline:
 
         await self._emit(
             state,
-            "分单局部精读",
-            f"对 {len(pending)} 页分单做四象限放大转写",
+            f"{doc_label}局部精读",
+            f"对 {len(pending)} 页{doc_label}做四象限放大转写",
             49,
         )
         warnings: list[str] = []
@@ -704,7 +758,7 @@ class Pipeline:
                     return
                 try:
                     text = await transcribe_house_zoom_page(
-                        self.gateway, page, images
+                        self.gateway, page, images, doc_label
                     )
                 except Exception as exc:  # noqa: BLE001 - 单页失败不阻断
                     warnings.append(f"第 {page.index} 页局部精读失败：{exc}")
@@ -739,8 +793,8 @@ class Pipeline:
         )
         await self._emit(
             state,
-            "分单局部精读",
-            f"局部精读完成：{done_count}/{len(house_indexes)} 页",
+            f"{doc_label}局部精读",
+            f"局部精读完成：{done_count}/{len(target_indexes)} 页",
             50,
             "warning" if warnings else "info",
         )
@@ -1193,6 +1247,15 @@ class Pipeline:
                 f"已按舱单生成 {len(house_bills)} 份分单（存在舱单时不使用分单页数据）"
             )
 
+        # 需求：没有主单号直接判定失败（主单号是 ERP 入库的必需条件）
+        if not _has_master_number(
+            state.get("master_bills") or [], house_bills, manifest_document
+        ):
+            raise PipelineError(
+                "NO_MAWB",
+                "未识别到主单号（MAWB），无法生成分单；请确认上传的是空运单证",
+            )
+
         house_payload = [bill.model_dump() for bill in house_bills]
         manifest_payload = (
             manifest_document.model_dump() if manifest_document is not None else None
@@ -1276,6 +1339,15 @@ class Pipeline:
                 await self._emit(state, label, "无分单与舱单，已跳过", 0, phase="skipped")
         pages = [PageRecord(**item) for item in state.get("pages") or []]
         house_bills = [HouseBill(**item) for item in state.get("house_bills") or []]
+        # 只有主单（或主单页读不出号）时不会经过抽取节点，这里兜住同一条规则：
+        # 没有主单号就是失败，避免「处理完成但什么都用不了」。
+        if not _has_master_number(
+            state.get("master_bills") or [], house_bills, state.get("manifest")
+        ):
+            raise PipelineError(
+                "NO_MAWB",
+                "未识别到主单号（MAWB），无法生成分单；请确认上传的是空运单证",
+            )
         # 舱单明细不进结果：结果里只保留转换后的分单；回查见 documents.json
         comparisons = [
             HouseBillComparison(**item) for item in state.get("comparisons") or []

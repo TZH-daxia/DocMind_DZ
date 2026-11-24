@@ -26,6 +26,7 @@ from app.prompts.loader import (
 from app.schemas.documents import PageRecord
 from app.schemas.fields import (
     CORE_HOUSE_KEYS,
+    HAWB_UNRECOGNIZED,
     HOUSE_FIELD_KEYS,
     HOUSE_KEY_BY_COMPARE_KEY,
     MANIFEST_FIELD_KEYS,
@@ -34,7 +35,7 @@ from app.schemas.fields import (
     PARTY_INTERFACE_KEYS,
     flatten_party_fields,
 )
-from app.service.normalizers import normalize_mawb, normalize_phone
+from app.service.normalizers import normalize_hawb, normalize_mawb, normalize_phone
 from app.service.ports import normalize_port_fields
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,20 @@ FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "货物描述",
     ),
 }
+
+# 舱单里「总运单汇总行」的行类型标记：这些行不产出分单
+_MASTER_ROW_TYPES = frozenset(
+    {"M", "MAWB", "MASTER", "T", "TOTAL", "主单", "总单", "合计", "汇总"}
+)
+
+# 汇总行的品名特征：没有分单号、品名又是「随附舱单/拼装」这类说明时按汇总行跳过
+_SUMMARY_PM_MARKERS = ("ATTACHED MANIFEST", "CONSOLIDATION")
+
+
+def _looks_like_summary_row(canonical: dict[str, Any]) -> bool:
+    text = str(canonical.get("pm") or "").upper()
+    return any(marker in text for marker in _SUMMARY_PM_MARKERS)
+
 
 NESTED_PARTY_ALIASES: dict[str, tuple[str, ...]] = {
     "name": ("company", "company_name", "companyname", "名称"),
@@ -173,17 +188,21 @@ async def transcribe_page(gateway, page: PageRecord, image_path: str) -> str:
 
 
 async def transcribe_house_zoom(
-    gateway, page: PageRecord, image_bytes: list[bytes]
+    gateway,
+    page: PageRecord,
+    image_bytes: list[bytes],
+    doc_label: str = "分单",
 ) -> str:
-    """分单页四象限局部精读：四张放大图一次调用，逐块逐字转写。
+    """单页四象限局部精读（分单 / 舱单通用）：四张放大图一次调用，逐块逐字转写。
 
+    舱单常是整票缩排的表格，小字比分单更糊，同样走这套四象限放大。
     图片只在内存里转 base64，不落盘到任务目录。
     """
 
     return await gateway.complete_vision(
-        "分单局部精读",
+        f"{doc_label}局部精读",
         load_house_zoom_prompt(),
-        f"以下是第 {page.index} 页（分单）的四个局部放大图，"
+        f"以下是第 {page.index} 页（{doc_label}）的四个局部放大图，"
         "请按左上、右上、左下、右下顺序逐字转写。",
         image_bytes=image_bytes,
     )
@@ -276,7 +295,8 @@ async def extract_manifest(gateway, pages: list[PageRecord], indexes: list[int])
         raise ExtractionError("EXTRACT_INVALID", "舱单抽取结果缺少 entries 数组")
 
     normalized_entries: list[dict[str, Any]] = []
-    dropped_no_hawb: list[int] = []
+    summary_rows: list[int] = []
+    unrecognized_rows: list[int] = []
     for position, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
             continue
@@ -284,20 +304,30 @@ async def extract_manifest(gateway, pages: list[PageRecord], indexes: list[int])
         raw_fields = entry.get("fields")
         fields_source = raw_fields if isinstance(raw_fields, dict) else entry
         canonical = canonical_payload(fields_source)
+        # 分单号：舱单里常见 `H-1077968462` / `HAWB-1077968462` 这种写法，
+        # 前缀与连字符都不是号本身，先清掉再判断是不是主单行 / 有没有分单号。
+        cleaned_hawb = normalize_hawb(canonical.get("hawb_no"))
+        if cleaned_hawb:
+            canonical["hawb_no"] = cleaned_hawb
+        else:
+            canonical.pop("hawb_no", None)
         hawb_no = str(canonical.get("hawb_no") or "").strip()
-        is_master_row = row_type in {"M", "MAWB", "MASTER", "主单", "总单"} or bool(
+        # 总运单汇总行：行类型明确标了主单/合计，或 AWB 号列本身就是主单号形状
+        is_master_row = row_type in _MASTER_ROW_TYPES or bool(
             re.fullmatch(r"\d{3}-?\d{8}", hawb_no)
         )
-        if not is_master_row and not hawb_no:
-            # 分单号是舱单行的主键：没有它就不可能是分单行。
-            # 舱单里这种行是**总运单汇总行**（AWB 号列写的是 MAWB 416-52342905），
-            # 或者是分单号没读出来 —— 两种情况都不能当成舱单数据行输出。
-            is_master_row = True
-            dropped_no_hawb.append(_to_int(entry.get("line_no"), position))
         if is_master_row:
-            # 总运单汇总行 / 读不出分单号的行：不作为分单行输出（也不再保存汇总值，
-            # 一致性核对已取消，汇总块没有消费方）
+            # 汇总行不产出分单（一致性核对已取消，汇总值也没有消费方）
             continue
+        if not hawb_no and _looks_like_summary_row(canonical):
+            # 没有分单号、品名还写着 CONSOLIDATION / ATTACHED MANIFEST：汇总行
+            summary_rows.append(_to_int(entry.get("line_no"), position))
+            continue
+        if not hawb_no:
+            # 需求：有主单号、但这一行的分单号读不出来时仍作为数据行输出，
+            # 值填占位字样，避免整票数据被丢掉。
+            canonical["hawb_no"] = HAWB_UNRECOGNIZED
+            unrecognized_rows.append(_to_int(entry.get("line_no"), position))
         # 舱单行的收发货人与分单同一套接口字段名（*_fhr_hawb / *_shr_hawb），
         # 所以这里要展开参与人嵌套对象，否则 20 个当事人字段全是空。
         entry_fields = flatten_party_fields(
@@ -321,9 +351,12 @@ async def extract_manifest(gateway, pages: list[PageRecord], indexes: list[int])
             }
         )
     warnings = _to_warnings(payload.get("warnings"))
-    if dropped_no_hawb:
-        lines = "、".join(str(item) for item in dropped_no_hawb)
-        warnings.append(f"第 {lines} 行没有分单号，已按总运单行跳过")
+    if summary_rows:
+        lines = "、".join(str(item) for item in summary_rows)
+        warnings.append(f"第 {lines} 行没有分单号且是汇总行，已跳过")
+    if unrecognized_rows:
+        lines = "、".join(str(item) for item in unrecognized_rows)
+        warnings.append(f"第 {lines} 行没有分单号，已填「{HAWB_UNRECOGNIZED}」")
     return {
         "entries": normalized_entries,
         "confidence": _to_float(payload.get("confidence"), 0.6),
@@ -387,16 +420,30 @@ def _normalize_house_bill_payload(payload: dict[str, Any]) -> dict[str, Any]:
     # 主单号：AWB 左上角常写成「前缀 + 机场三字码 + 序号」（416PVG52331591），
     # 模型容易把它当成非主单号而置空 —— 这里统一归一成 416-52331591；
     # 值为空时再回退到 evidence 里引用的原文（模型有时把值只写进 quote）。
-    mawb_meta = _candidate_meta(payload.get("evidence")).get("mawb") or {}
+    evidence_meta = _candidate_meta(payload.get("evidence"))
+    mawb_meta = evidence_meta.get("mawb") or {}
     mawb = normalize_mawb(fields.get("mawb")) or normalize_mawb(mawb_meta.get("quote"))
     if mawb:
         fields["mawb"] = mawb
+
+    # 分单号：去掉「H-」「HAWB-」「MAWB-」这类前缀和所有连字符，只留字母数字
+    # （纯数字为主，少数带英文前缀如 EDC2037060）；值为空时同样回退到 quote。
+    hawb_meta = evidence_meta.get("hawb") or {}
+    raw_hawb = normalize_hawb(fields.get("hawb")) or normalize_hawb(
+        hawb_meta.get("quote")
+    )
+    if raw_hawb:
+        fields["hawb"] = raw_hawb
+    # 需求：分单号读不出来时不置空，填占位值，单据照常产出（主单号缺失才会让任务失败）
+    hawb_missing = not fields.get("hawb")
+    if hawb_missing:
+        fields["hawb"] = HAWB_UNRECOGNIZED
     warnings = _to_warnings(payload.get("warnings"))
     missing = [key for key in CORE_HOUSE_KEYS if not fields.get(key)]
     if missing:
         warnings.append(f"分单有 {len(missing)} 个核心字段未取到值")
-    if not fields.get("hawb"):
-        warnings.append("未识别到分单号，无法与舱单核对")
+    if hawb_missing:
+        warnings.append(f"未识别到分单号，已填「{HAWB_UNRECOGNIZED}」")
     confidence = _to_float(payload.get("confidence"), 0.6)
     return {
         "fields": fields,

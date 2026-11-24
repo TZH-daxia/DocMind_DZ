@@ -169,6 +169,10 @@ HOUSE_KEY_BY_COMPARE_KEY: dict[str, str] = {
 }
 MANIFEST_FIELD_KEYS: tuple[str, ...] = tuple(spec.key for spec in MANIFEST_FIELD_SPECS)
 
+# 分单号识别不到时的占位值。
+# 需求：有主单号但分单号读不出来，单据照常产出，分单号填这个字样，不留空。
+HAWB_UNRECOGNIZED = "识别失败"
+
 # 抽取结果里必须尽量有值的核心字段（缺失才提示）
 CORE_HOUSE_KEYS: tuple[str, ...] = (
     "hawb",

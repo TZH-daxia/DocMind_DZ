@@ -15,6 +15,7 @@ from app.config import Settings
 # 分单按单证接口字段名输出（件数/重量/体积只有制单口径 zd*）
 _MOCK_HOUSE_BILLS = [
     {
+        "mawb": "999-12345678",
         "hawb": "MOCK0001",
         "sfg": "PVG",
         "mdg": "LAX",
@@ -42,6 +43,7 @@ _MOCK_HOUSE_BILLS = [
         "pm": "MOCK CARGO",
     },
     {
+        "mawb": "999-12345678",
         "hawb": "MOCK0002",
         "sfg": "PVG",
         "mdg": "LAX",

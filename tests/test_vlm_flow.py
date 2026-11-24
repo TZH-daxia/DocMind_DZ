@@ -115,6 +115,67 @@ async def test_house_zoom_writes_text_images_and_is_idempotent(settings, tmp_pat
     assert gateway.calls[-1] == 4
 
 
+async def test_manifest_page_also_goes_through_zoom(settings, tmp_path):
+    """有舱单时精读目标是舱单页：舱单缩小排版后小字更糊，同样要放大转写。"""
+
+    gateway = _FakeVisionGateway("### 左上（part 1）\n1077968462")
+    store = FileStore(settings)
+    task_dir = store.task_dir(TASK_ID)
+    write_pdf(
+        task_dir / "bundle.pdf",
+        [
+            "HOUSE AIR WAYBILL\nHAWB NO.: 1077968462",
+            "CARGO MANIFEST\nHAWB | DEST | PCS\n1077968462 | LAX | 10",
+        ],
+    )
+    pipeline = Pipeline(settings, store, gateway)
+
+    pages = [
+        PageRecord(
+            index=1,
+            text="分单页",
+            text_source="text_layer",
+            source_file="bundle.pdf",
+            page_in_file=1,
+        ),
+        PageRecord(
+            index=2,
+            text="舱单页",
+            text_source="text_layer",
+            source_file="bundle.pdf",
+            page_in_file=2,
+        ),
+    ]
+    segments = [
+        Segment(segment_id="seg_001", kind="house_bill", page_indexes=[1]),
+        Segment(segment_id="seg_002", kind="manifest", page_indexes=[2]),
+    ]
+    state = {
+        "task_id": TASK_ID,
+        "pages": [page.model_dump() for page in pages],
+        "segments": [segment.model_dump() for segment in segments],
+        "parser": "pdf",
+        "warnings": [],
+        "files": [
+            {
+                "name": "bundle.pdf",
+                "path": str(task_dir / "bundle.pdf"),
+                "size": 1,
+            }
+        ],
+        "page_boundaries": [1, 2],
+    }
+
+    result = await pipeline.transcribe_house_zoom(state)
+
+    by_index = {item["index"]: PageRecord(**item) for item in result["pages"]}
+    assert by_index[2].zoom_text == "### 左上（part 1）\n1077968462"
+    # 有舱单时不再精读分单页（那类页此时不参与抽取）
+    assert by_index[1].zoom_text is None
+    assert gateway.calls[-1] == 4
+    assert store.zoom_status_path(TASK_ID).exists()
+
+
 def test_format_pages_prefers_zoom_text() -> None:
     page = PageRecord(index=1, text="整页文本", zoom_text="局部文本")
 

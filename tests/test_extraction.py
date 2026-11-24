@@ -3,7 +3,7 @@
 import json
 
 from app.schemas.documents import PageRecord
-from app.schemas.fields import HOUSE_FIELD_KEYS
+from app.schemas.fields import HAWB_UNRECOGNIZED, HOUSE_FIELD_KEYS
 from app.service.extraction import (
     _normalize_house_bill_payload,
     canonical_payload,
@@ -58,6 +58,53 @@ def test_phone_drops_plus_and_china_prefix():
 
     assert fields["phone_fhr_hawb"] == "51257382098"
     assert fields["phone_shr_hawb"] == "18649636328"
+
+
+def test_house_bill_hawb_strips_prefix_and_dash():
+    """分单号里的「H-」「HAWB-」前缀与连字符都要清掉。"""
+
+    fields = _normalize_house_bill_payload(
+        {"fields": {"hawb": "HAWB-1077968462"}}
+    )["fields"]
+
+    assert fields["hawb"] == "1077968462"
+
+
+def test_house_bill_without_hawb_fills_placeholder():
+    """有主单号、但分单号读不出来：仍产出单据，分单号填「识别失败」。"""
+
+    result = _normalize_house_bill_payload(
+        {"fields": {"mawb": "999-12345678", "sfg": "PVG"}}
+    )
+
+    assert result["fields"]["hawb"] == HAWB_UNRECOGNIZED
+    assert any("识别失败" in warning for warning in result["warnings"])
+
+
+class _FakeHawbNoiseGateway:
+    """舱单里分单号写成 H-xxxx，汇总行写成 MAWB 416-xxxx。"""
+
+    async def complete(self, label, system_prompt, human_prompt):
+        return json.dumps(
+            {
+                "entries": [
+                    {"line_no": 1, "fields": {"hawb": "H-1077968462", "pieces": "10"}},
+                    {"line_no": 2, "fields": {"hawb": "HAWB-1077 968462", "pieces": "2"}},
+                    {"line_no": 3, "fields": {"hawb": "MAWB 416-52342905", "pieces": "12"}},
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+
+async def test_manifest_hawb_strips_prefix_and_dash():
+    pages = [PageRecord(index=1, text="CARGO MANIFEST")]
+    result = await extract_manifest(_FakeHawbNoiseGateway(), pages, [1])
+
+    hawb_nos = [entry["fields"]["hawb_no"] for entry in result["entries"]]
+    # 前两行清洗成同一号码；第三行是主单号，仍按总运单行跳过
+    assert hawb_nos == ["1077968462", "1077968462"]
+    assert all("-" not in value for value in hawb_nos)
 
 
 def test_canonical_payload_keeps_standard_structure():
@@ -254,6 +301,48 @@ async def test_manifest_master_row_without_hawb_is_skipped():
     assert result["entries"][0]["fields"]["hawb_no"] == "SZA26100005"
     assert "master" not in result
     assert any("没有分单号" in warning for warning in result["warnings"])
+
+class _FakeManifestMissingHawbGateway:
+    """舱单里有数据行，但某几行的分单号读不出来（主单号是有的）。"""
+
+    async def complete(self, label, system_prompt, human_prompt):
+        return json.dumps(
+            {
+                "entries": [
+                    {
+                        "line_no": 1,
+                        "fields": {
+                            "mawb": "999-12345678",
+                            "pieces": "12",
+                            "weight": "186.5",
+                        },
+                    },
+                    {
+                        "line_no": 2,
+                        "fields": {
+                            "mawb": "999-12345678",
+                            "hawb_no": "1077968462",
+                            "pieces": "8",
+                        },
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+
+async def test_manifest_row_without_hawb_is_kept_with_placeholder():
+    """没有分单号的数据行不再被丢弃：值填「识别失败」，保证整票数据不丢。"""
+
+    pages = [PageRecord(index=1, text="CARGO MANIFEST")]
+    result = await extract_manifest(_FakeManifestMissingHawbGateway(), pages, [1])
+
+    assert [entry["fields"]["hawb_no"] for entry in result["entries"]] == [
+        HAWB_UNRECOGNIZED,
+        "1077968462",
+    ]
+    assert any("识别失败" in warning for warning in result["warnings"])
+
 
 def test_manual_only_fields_are_not_extracted_at_all():
     """计费重量与申报价值不再抽取：这两个 key 不进入字段表，前端仍可人工填。"""

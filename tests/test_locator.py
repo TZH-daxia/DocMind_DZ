@@ -606,6 +606,78 @@ def test_search_variants_only_adds_thousands_for_short_numbers() -> None:
     assert "7,525,855,105" not in _search_variants("07525855105")
 
 
+def test_manifest_header_field_is_located_from_another_page(tmp_path: Path) -> None:
+    """页头字段（航班号）印在另一页时也要有框。
+
+    真实案例：同一票两份分单共用两页，第 2 份的锚点（分单号）只在第 2 页命中，
+    而航班号只印在第 1 页页头 —— 老实现「锚点页处理完就 return」，第 2 份永远没框。
+    """
+
+    import pymupdf
+
+    path = tmp_path / "manifest_two_pages.pdf"
+    document = pymupdf.open()
+    first = document.new_page(width=PAGE_WIDTH, height=PAGE_HEIGHT)
+    first.insert_text((40, 80), "REQUESTED FLIGHT/DATE", fontsize=8, fontname="helv")
+    first.insert_text((40, 100), "N8652/30", fontsize=8, fontname="helv")
+    first.insert_text((40, 300), "EDC2037060", fontsize=8, fontname="helv")
+    second = document.new_page(width=PAGE_WIDTH, height=PAGE_HEIGHT)
+    second.insert_text((40, 100), "SHA71763620", fontsize=8, fontname="helv")
+    document.save(path)
+    document.close()
+
+    locations = locate_manifest_fields(
+        path,
+        {1: 1, 2: 2},
+        {"hawb_no": "SHA71763620", "hbh": "N8652"},
+        anchor="SHA71763620",
+    )
+
+    assert locations["hawb_no"][0]["page"] == 2
+    # 页头字段允许跨页取第一处命中
+    assert locations["hbh"][0]["page"] == 1
+
+
+def test_missing_value_falls_back_to_label_box(tmp_path: Path, caplog) -> None:
+    """值在页面上搜不到时，至少给「栏位名」一个框，并打一条可观测的兜底日志。"""
+
+    pdf = _build_pdf(
+        tmp_path / "label_fallback.pdf",
+        [
+            (40, 300, "NO. OF PIECES RCP"),
+            (40, 400, "SOME OTHER TEXT"),
+        ],
+    )
+    with caplog.at_level("INFO", logger="app.collector.locator"):
+        locations = locate_fields(pdf, {1: 1}, {"zdpiece": "12"})
+
+    assert "zdpiece" in locations
+    _, y = _box_origin(locations["zdpiece"][0]["bbox"])
+    # 基线 y=300 的文字，bbox 上沿约在 289（字号 8）
+    assert 275 < y < 305
+    # 兜底是否频繁触发，靠这条日志判断（持续为 0 说明主路径足够）
+    assert "字段定位兜底" in caplog.text
+    assert "zdpiece" in caplog.text
+
+
+def test_numeric_value_ignores_longer_number(tmp_path: Path) -> None:
+    """`6.95` 不能被更长的数字 `16.95` 吃掉（子串命中要按整词校验）。"""
+
+    pdf = _build_pdf(
+        tmp_path / "numeric_boundary.pdf",
+        [
+            (40, 100, "16.95"),
+            (40, 180, "RATE/CHARGE"),
+            (40, 200, "6.95"),
+        ],
+    )
+    locations = locate_fields(pdf, {1: 1}, {"rate": "6.95"})
+
+    _, y = _box_origin(locations["rate"][0]["bbox"])
+    # 应落在 y=200 那一处（基线 200 → bbox 上沿约 189），而不是 y=100 的 16.95
+    assert 175 < y < 205
+
+
 def test_quote_cells_anchor_locates_numeric_field(tmp_path: Path) -> None:
     """引用是「单元格 | 单元格」拼接（表格转写特有）时，用与值相同的单元格当锚点。
 

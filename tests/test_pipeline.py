@@ -89,13 +89,33 @@ async def test_pipeline_succeeds_with_master_only_file(settings, tmp_path):
     assert any("主单" in warning for warning in result["warnings"])
 
 
-async def test_manifest_only_file_extracts_rows_as_house_bills(settings, tmp_path):
-    """只有舱单：舱单行直接转换成分单，不做核对。"""
+async def test_manifest_only_file_fails_without_master_number(settings, tmp_path):
+    """只有舱单、且舱单里读不到主单号：任务失败（NO_MAWB）。
+
+    需求：没有主单号就判定失败 —— 主单号是 ERP 入库的必需条件，
+    与其「成功但一条都用不了」，不如直接报错让用户重新上传。
+    """
 
     pdf = write_pdf(tmp_path / "manifest_only.pdf", [MANIFEST_PAGE])
     service = make_service(settings)
     snapshot = service.create_task(
         UploadedDocument(filename="manifest_only.pdf", content=pdf.read_bytes())
+    )
+    await _run_task(service, snapshot.task_id)
+
+    snapshot = service.get_snapshot(snapshot.task_id)
+    assert snapshot.status == "failed"
+    assert snapshot.error is not None
+    assert snapshot.error.code == "NO_MAWB"
+
+
+async def test_master_and_manifest_rows_become_house_bills(settings, tmp_path):
+    """主单 + 舱单：舱单行转换成分单，不做核对。"""
+
+    pdf = write_pdf(tmp_path / "master_manifest.pdf", [MASTER_PAGE, MANIFEST_PAGE])
+    service = make_service(settings)
+    snapshot = service.create_task(
+        UploadedDocument(filename="master_manifest.pdf", content=pdf.read_bytes())
     )
     await _run_task(service, snapshot.task_id)
 
@@ -110,7 +130,6 @@ async def test_manifest_only_file_extracts_rows_as_house_bills(settings, tmp_pat
     assert result["comparisons"] == []
     assert result["totals_checks"] == []
     assert result["summary"]["inconsistent"] == 0
-    assert any("只包含舱单" in warning for warning in result["warnings"])
 
     events = service.read_events(snapshot.task_id)
     skipped = {event.step for event in events if event.phase == "skipped"}

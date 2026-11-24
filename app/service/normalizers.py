@@ -130,6 +130,80 @@ def normalize_doc_no(value: str | None) -> str:
     return re.sub(r"[^0-9A-Z]", "", basic_normalize(value))
 
 
+# 分单号上可能被模型/原文档带出来的标签前缀。长的写在前面，避免 HAWB 抢先吃掉
+# HOUSE AIR WAYBILL；单字母 H 单独处理（只在后面跟分隔符时才算前缀）。
+_HAWB_LABELS: tuple[str, ...] = (
+    "HOUSE AIR WAYBILL",
+    "HOUSE WAYBILL",
+    "MASTER AIR WAYBILL",
+    "HOUSE AWB",
+    "MASTER AWB",
+    "HAWB",
+    "MAWB",
+    "HWB",
+    "HBL",
+    "AWB",
+    "分运单号",
+    "分单号",
+    "主单号",
+)
+_HAWB_LABEL_PATTERN = "|".join(re.escape(label) for label in _HAWB_LABELS)
+# 标签 + 分隔符：`HAWB-1077968462`、`分单号：1077…`、`MAWB 416-52331591`
+_HAWB_LABEL_SEP_RE = re.compile(
+    r"^(?:" + _HAWB_LABEL_PATTERN + r")[\s:：\-_/.、]+",
+    re.IGNORECASE,
+)
+# 标签直接粘着数字：`HAWB1077968462`。只在后面还剩 6 位以上时才当标签剥，
+# 免得把 `HAWB0001` 这类本身就是号的短串削成 `0001`。
+_HAWB_LABEL_GLUED_RE = re.compile(
+    r"^(?:" + _HAWB_LABEL_PATTERN + r")(?=[0-9A-Z]{6,}$)",
+    re.IGNORECASE,
+)
+# 单字母 H 只有跟着分隔符时才算前缀（H-1077968462），避免削掉 H1234567 这类真号
+_HAWB_SINGLE_H_RE = re.compile(r"^H[\s:：\-_/.、]+", re.IGNORECASE)
+# 各种破折号统一成半角 -
+_HAWB_DASHES = str.maketrans("‐‑‒–—―−－", "--------")
+_HAWB_NOISE_RE = re.compile(r"[^0-9A-Z]")
+# 清洗后只剩这些字样（表头文字漏进值里）时视为没有分单号
+_HAWB_LABEL_ONLY = {
+    label.upper().replace(" ", "") for label in _HAWB_LABELS
+} | {"H"}
+
+
+def normalize_hawb(value: str | None) -> str | None:
+    """分单号归一：去掉「H-」「HAWB」「MAWB」这类前缀和所有连字符。
+
+    舱单的分单号一栏经常写成 `H-1077968462`、`HAWB-1077968462`，也可能把主单号写进来
+    （`416-52331591`）。业务上分单号只保留字母数字：**大部分是纯数字，少部分带英文前缀**
+    （`EDC2037060`），所以这里把分隔符与前缀特征一律清掉。
+
+    去掉前缀后什么都不剩（原值只有前缀/分隔符）时返回 None，交给调用方按"没有分单号"处理。
+    注意：不带分隔符的 `H1234567` 不会被当成前缀削掉 —— 它可能是真实号段。
+    """
+
+    if value is None:
+        return None
+    text = unicodedata.normalize("NFKC", str(value)).translate(_HAWB_DASHES).strip()
+    if not text:
+        return None
+    text = text.upper()
+
+    # 允许多层前缀：H-HAWB-1077968462
+    for _ in range(4):
+        before = text
+        text = _HAWB_SINGLE_H_RE.sub("", text)
+        text = _HAWB_LABEL_SEP_RE.sub("", text)
+        text = _HAWB_LABEL_GLUED_RE.sub("", text)
+        text = text.lstrip(" :：-_/.、")
+        if text == before:
+            break
+
+    cleaned = _HAWB_NOISE_RE.sub("", text)
+    if not cleaned or cleaned in _HAWB_LABEL_ONLY:
+        return None
+    return cleaned
+
+
 # 主单号：3 位航司前缀 + 可选的机场三字码 + 8 位序号
 _MAWB_IATA = re.compile(r"^(\d{3})-?(?:[A-Z]{3})?-?(\d{8})$")
 

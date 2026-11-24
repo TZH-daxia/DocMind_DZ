@@ -168,12 +168,12 @@ class FileStore:
         return directory
 
     def transcription_path(self, task_id: str, index: int, suffix: str = "") -> Path:
-        """整页转写 page_001.md；分单局部精读 page_001_zoom.md。"""
+        """整页转写 page_001.md；局部精读（分单/舱单）page_001_zoom.md。"""
 
         return self.transcription_dir(task_id) / f"page_{index:03d}{suffix}.md"
 
     def zoom_status_path(self, task_id: str) -> Path:
-        """分单局部精读的完成记录（含跳过/失败页，避免断点续跑无限重试）。"""
+        """局部精读（分单/舱单）的完成记录（含跳过/失败页，避免断点续跑无限重试）。"""
 
         return self.transcription_dir(task_id) / "zoom.json"
 

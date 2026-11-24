@@ -434,12 +434,14 @@ class TaskService:
             )
             return completed
 
-        # 有分单且没有舱单才做局部精读；有舱单时（以舱单为准）该节点被路由跳过
-        if (
-            "house_bill" in kinds
-            and "manifest" not in kinds
-            and not self.store.zoom_status_path(task_id).exists()
-        ):
+        # 分单页 / 舱单页都要做局部精读：目标页存在但 zoom.json 还没落盘，说明节点没跑完。
+        # （有舱单时精读的是舱单页，没有舱单才是分单页，具体由节点内部决定。）
+        target_kind = "manifest" if "manifest" in kinds else "house_bill"
+        has_target_pages = any(
+            segment.get("kind") == target_kind and segment.get("page_indexes")
+            for segment in segments
+        )
+        if has_target_pages and not self.store.zoom_status_path(task_id).exists():
             return completed
         completed.append("transcribe_house_zoom")
         if not self.store.documents_path(task_id).exists():

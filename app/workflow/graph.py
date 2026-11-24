@@ -16,8 +16,8 @@ NODE_SEQUENCE: tuple[tuple[str, str, int], ...] = (
     ("render_document", "解析文档", 5),
     ("transcribe_pages", "图像转写", 25),
     ("classify_pages", "识别主单/分单/舱单", 45),
-    # 先整页转写并分类，再只对分单页做四象限局部精读（小字特写）
-    ("transcribe_house_zoom", "分单局部精读", 48),
+    # 先整页转写并分类，再对分单页 / 舱单页做四象限局部精读（小字特写）
+    ("transcribe_house_zoom", "局部精读", 48),
     ("extract_documents", "抽取分单或舱单字段", 55),
     ("verify_consistency", "核对分单与舱单", 85),
     ("build_result", "生成结果", 95),
@@ -37,16 +37,15 @@ def _first_pending_node(state: AnalysisState) -> str:
 def _route_after_classify(state: AnalysisState) -> str:
     """分类后的三种走向：
 
-    - 有分单：先做局部精读，再抽取；
-    - 只有舱单：跳过局部精读（那是分单专用），但**必须**进抽取节点把舱单字段抽出来；
+    - 有分单或舱单：先做局部精读（舱单缩排后小字更糊，同样要放大），再抽取；
     - 只有主单（没有分单也没有舱单）：主单只登记不抽取，直接装配结果。
+
+    精读节点内部决定读哪一类页：有舱单时只精读舱单页（分单页此时不抽取），
+    没有舱单才精读分单页。
     """
 
     kinds = {item.get("kind") for item in state.get("segments") or ()}
-    # 有舱单时以舱单为准：分单页不再抽取，也就不需要分单精读，直接进抽取节点
-    if "manifest" in kinds:
-        return "extract_documents"
-    if "house_bill" in kinds:
+    if "manifest" in kinds or "house_bill" in kinds:
         return "transcribe_house_zoom"
     return "build_result"
 
